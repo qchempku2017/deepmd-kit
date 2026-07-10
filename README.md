@@ -114,14 +114,18 @@ There are two tiers to keep straight:
   fp32 dense path (or the fp32 `.pt2` on Volta/Turing).
 - **Triton / AOTInductor unsupported (Pascal `sm_60` only):** Triton (shipped
   with PyTorch 2.11/2.12) cannot compile for Pascal, so on P100
-  `dp --pt freeze` to `.pt2`, `torch.compile`, Triton kernels, and LAMMPS
-  DPA-4 inference are **unavailable** and fail fast with an actionable
-  message. **Volta (V100) supports `.pt2` freeze and LAMMPS DPA-4 (confirmed
-  by testing); Turing is expected but unverified.**
+  `dp --pt freeze` to `.pt2`, `torch.compile`, and Triton kernels are
+  **unavailable** and fail fast with an actionable message. **However, a new
+  `.pth` (TorchScript) freeze path** (`dp --pt freeze --legacy-gpu`) enables
+  LAMMPS DPA-4 inference on Pascal without Triton. Volta (V100) and Turing
+  support `.pt2` freeze and LAMMPS DPA-4 (confirmed on V100 by testing).
 
 ```sh
 dp --pt train input.json          # set descriptor.use_amp=false on pre-Ampere GPUs (auto-handled)
 dp --pt test -m model.ckpt.pt -s system/
+
+# Freeze for LAMMPS on Pascal/P100:
+dp --pt freeze --legacy-gpu -c model.ckpt.pt -o frozen_model.pth
 ```
 
 ```python
@@ -129,11 +133,12 @@ from deepmd.calculator import DP
 calc = DP(model="model.ckpt.pt")   # ASE calculator, pure eager, no Triton
 ```
 
-**Does not work on Pascal (`sm_60`):** `dp --pt freeze` to `.pt2`, DPA-4
-inference through LAMMPS, `torch.compile`, Triton/CuTe fused kernels, bfloat16
-autocast. Older DP / DPA-1 / DPA-2 / DPA-3 models are unaffected (their C++
-ops compile for `sm_60`). See the full guide: [Install and run on legacy
-NVIDIA GPUs](./doc/install/install-legacy-gpu.md).
+**Does not work on Pascal (`sm_60`):** `dp --pt freeze` to `.pt2`,
+`torch.compile`, Triton/CuTe fused kernels, bfloat16 autocast.
+**Works on Pascal via `.pth` freeze:** LAMMPS DPA-4 inference
+(`dp --pt freeze --legacy-gpu`). Older DP / DPA-1 / DPA-2 / DPA-3 models
+are unaffected (their C++ ops compile for `sm_60`). See the full guide:
+[Install and run on legacy NVIDIA GPUs](./doc/install/install-legacy-gpu.md).
 
 ## Code structure
 

@@ -8,16 +8,50 @@ capability tiers** to keep straight:
    (`sm_60`, e.g. Tesla P100), Volta (`sm_70`, e.g. V100) and Turing (`sm_75`,
    e.g. RTX 20 / T4) all lack native bf16, so DPA-4 bfloat16 autocast is
    auto-disabled there.
-2. **Triton / `torch.compile` / `.pt2` freeze / LAMMPS tier — requires Volta
+2. **Triton / `torch.compile` / `.pt2` freeze tier — requires Volta
    (`sm_70+`).** Triton (shipped with PyTorch 2.11/2.12) supports Volta and
    newer but **cannot compile for Pascal (`sm_60`)** — AOTInductor is confirmed
-   broken there. Volta and Turing run `.pt2` freeze and LAMMPS DPA-4 normally.
+   broken there. However, DPA-4 now has a **`.pth` (TorchScript) freeze path**
+   (`dp --pt freeze --legacy-gpu`) that covers LAMMPS inference on Pascal
+   without Triton (see the Quick Start below).
 
 So a **Volta/Turing** user only needs point 1 (bf16 stays off, everything else
-works). A **Pascal (P100)** user needs both: bf16 off **and** the dense eager
-path for training/inference, because `.pt2`/`torch.compile`/Triton are
-unavailable.
+works). A **Pascal (P100)** user needs bf16 off and the `.pth` freeze path
+for LAMMPS; training and `dp --pt test` still use the dense eager path.
 :::
+
+## Quick Start for P100/Pascal GPUs
+
+:::{tip}
+**Good news:** DPA-4 now supports LAMMPS on P100/Pascal GPUs through a new
+`.pth` (TorchScript) freeze path. You no longer need Volta+ to run DPA-4
+in LAMMPS.
+:::
+
+Here is the complete workflow from training to LAMMPS on a P100 or other
+Pascal GPU:
+
+```bash
+# Step 1: Train normally (works on any GPU)
+dp --pt train input.json
+
+# Step 2: Freeze with --legacy-gpu flag (produces .pth instead of .pt2)
+dp --pt freeze --legacy-gpu -c checkpoint.pt -o frozen_model.pth
+
+# Step 3: Use in LAMMPS (same as any other .pth model)
+# In LAMMPS input:
+# pair_style deepmd frozen_model.pth
+```
+
+The `--legacy-gpu` flag converts the model to TorchScript (`.pth`) instead of
+AOTInductor (`.pt2`). The `.pth` file works with LAMMPS via the standard
+`DeepPotPT` loader, the same as any other `.pth` frozen model. Performance is
+about 1.5–3× slower than `.pt2` on Volta+ GPUs, but the model remains fully
+GPU-accelerated and does not fall back to CPU.
+
+If you are on Volta (`sm_70`) or newer, use the standard `.pt2` freeze path
+(`dp --pt freeze -c checkpoint.pt -o frozen_model.pt2` without `--legacy-gpu`)
+for the best performance.
 
 ## 1. Why pre-Ampere GPUs need care
 
@@ -42,13 +76,13 @@ warning** on pre-Ampere GPUs.
 
 ## 2. Capability tiers at a glance
 
-| Family | Examples | Compute capability | native bf16 | Triton / `.pt2` / LAMMPS | What applies |
-|--------|----------|-------------------|-------------|--------------------------|--------------|
-| Pascal | Tesla P100, GTX 10 | `sm_60`/`sm_62` | **no** | **no** | bf16 auto-off **+** dense eager path (no `.pt2`/compile/Triton/LAMMPS) |
-| Volta | V100, Titan V | `sm_70`/`sm_72` | **no** | **yes** | bf16 auto-off; `.pt2`/compile/LAMMPS work |
-| Turing | RTX 20, T4 | `sm_75` | **no** | **yes** | bf16 auto-off; `.pt2`/compile/LAMMPS work |
-| Ampere | A100, RTX 30 | `sm_80`/`sm_86` | yes | yes | fully supported (all paths) |
-| Ada/Hopper | RTX 40, H100 | `sm_89`/`sm_90` | yes | yes | fully supported |
+| Family | Examples | Compute capability | native bf16 | `.pt2` / Triton / compile | `.pth` freeze / LAMMPS | What applies |
+|--------|----------|-------------------|-------------|---------------------------|------------------------|--------------|
+| Pascal | Tesla P100, GTX 10 | `sm_60`/`sm_62` | **no** | **no** | **✅ yes** (non-spin only) | bf16 auto-off; `.pth` freeze → LAMMPS (energy only); dense eager for train/test |
+| Volta | V100, Titan V | `sm_70`/`sm_72` | **no** | **yes** | yes (`.pt2` preferred) | bf16 auto-off; `.pt2`/compile/LAMMPS work |
+| Turing | RTX 20, T4 | `sm_75` | **no** | **yes** | yes (`.pt2` preferred) | bf16 auto-off; `.pt2`/compile/LAMMPS work |
+| Ampere | A100, RTX 30 | `sm_80`/`sm_86` | yes | yes | yes (`.pt2` preferred) | fully supported (all paths) |
+| Ada/Hopper | RTX 40, H100 | `sm_89`/`sm_90` | yes | yes | yes (`.pt2` preferred) | fully supported |
 
 DeePMD-kit queries `torch.cuda.get_device_capability()` and uses `cap >= 8`
 for the bf16/TF32 axis and `cap >= 7` for the Triton/AOTInductor axis. Both
@@ -225,20 +259,30 @@ What **works**:
   on the dense float32 eager path.
 - ✅ DPA-4 inference via `dp --pt test` and the ASE calculator, loading the
   `.pt` checkpoint eagerly.
+- ✅ `dp --pt freeze --legacy-gpu` — converts the model to TorchScript `.pth`
+  format, which works in LAMMPS on any CUDA GPU (see
+  [Quick Start](#quick-start-for-p100pascal-gpus)).
+- ✅ DPA-4 inference in **LAMMPS** via the `.pth` frozen model (use
+  `pair_style deepmd frozen_model.pth` with the standard `DeepPotPT` loader).
+- ✅ DPA-4 energy (non-spin) models — supported through the `.pth` freeze path.
+  Spin models (native-spin and virtual-spin) are **not** supported by `.pth`
+  freeze; use the `.pt2` path (``dp --pt freeze`` without ``--legacy-gpu``)
+  for spin models.
 - ✅ Checkpoint save / resume (`model.ckpt.pt`).
 - ✅ Older DP / DPA-1 / DPA-2 / DPA-3 models — unaffected (their C++ ops
   compile for `sm_60`).
 
 What **does not work** on Pascal:
 
-- ❌ `dp --pt freeze` of a DPA-4 checkpoint to `.pt2` (AOTInductor lowers
-  through Triton, which cannot compile for `sm_60`). `dp --pt freeze` now
-  **fails fast** with an actionable message. You do **not** need a `.pt2` for
-  ASE or `dp --pt test` — the `.pt` checkpoint is already loadable.
-- ❌ DPA-4 inference through **LAMMPS** (the LAMMPS C++ path for DPA-4 loads
-  only a `.pt2`; there is no TorchScript/eager fallback because SeZM computes
-  forces via `autograd.grad(create_graph=True)`, which TorchScript cannot
-  represent). **DPA-4 in LAMMPS requires Volta-or-newer (`sm_70+`).**
+- ❌ `dp --pt freeze` (without `--legacy-gpu`) of a DPA-4 checkpoint to `.pt2`
+  — AOTInductor lowers through Triton, which cannot compile for `sm_60`. The
+  standard freeze now **fails fast** with an actionable message. Use
+  `--legacy-gpu` for Pascal instead.
+- ❌ DPA-4 **spin** models (native-spin and virtual-spin) via the `.pth`
+  freeze path — ``DeepPotPT.forward_lower`` does not supply the
+  ``extended_spin`` tensor that spin models require. Spin models must use
+  the `.pt2` freeze path (``dp --pt freeze`` without ``--legacy-gpu``),
+  which in turn requires Volta+ (``sm_70+``).
 - ❌ `torch.compile` (`model.use_compile` / `DP_COMPILE_INFER`) — lowers through
   Triton; unsupported on `sm_60`. Setting either on Pascal now raises a clear
   `RuntimeError`.
@@ -274,15 +318,87 @@ fail-fast guards:
 - The `torch.compile` guard has no override by design, because an unsupported
   compile path produces broken artifacts; use a Volta+ GPU instead.
 
-:::{warning}
-LAMMPS DPA-4 on Pascal is an architectural limitation, not a configuration
-one: no combination of flags produces a usable DPA-4 `.pt2` on `sm_60`. If
-LAMMPS DPA-4 on P100 is a hard requirement, it needs a substantial (non-
-trivial) port — contact the maintainers. On Volta/Turing, LAMMPS DPA-4 works
-as documented in the [DPA-4 LAMMPS section](../model/dpa4.md).
+:::{note}
+**Performance note:** The `.pth` (TorchScript) freeze path is typically
+1.5–3× slower than `.pt2` (AOTInductor) on Volta+ GPUs because it lacks
+Triton-fused kernels. However, it is still fully GPU-accelerated (no CPU
+fallback) and is the only freeze option for Pascal. On Volta+ GPUs, use
+the standard `dp --pt freeze` (`.pt2`) for the best performance.
 :::
 
-## 8. Why this design
+## 8. How the `.pth` freeze path works
+
+The `--legacy-gpu` flag triggers a different freeze pipeline:
+
+1. **`make_fx` materializes `autograd.grad`**: During a standard forward pass,
+   DPA-4/SeZM computes forces via `torch.autograd.grad(create_graph=True)`.
+   TorchScript cannot trace through `autograd.grad` directly. The `.pth` freeze
+   uses `torch.fx.experimental.proxy_tensor.make_fx` to trace the forward pass
+   and materialize the gradient computation into pure PyTorch operations
+   (`bmm`, `einsum`, `index_add`, etc.) — no `autograd.grad` nodes remain.
+
+2. **TorchScript traces the FX graph**: The resulting flat graph of standard
+   PyTorch ops is traced into TorchScript (`.pth`). Because every operation is
+   a plain PyTorch op, the trace works on any CUDA architecture that PyTorch
+   supports, including `sm_60`.
+
+3. **No Triton required**: Unlike the `.pt2` (AOTInductor) path, the `.pth`
+   path never invokes Triton or `torch.compile`. This is what makes it work on
+   Pascal GPUs.
+
+4. **Environment variable ``DP_FREEZE_FORCE_PTH``**: Set ``DP_FREEZE_FORCE_PTH=1``
+   to force the `.pth` freeze path even on Volta+ GPUs (suppresses the
+   performance warning). This is useful for debugging or when you need
+   TorchScript portability across heterogeneous GPU clusters.
+
+The trade-off is that Triton-fused kernels (used in the `.pt2` path) are
+faster than the equivalent sequence of individual PyTorch ops in the `.pth`
+path. On Volta+ GPUs, prefer `.pt2`; on Pascal, `.pth` is the only option.
+
+## 9. Troubleshooting the `.pth` freeze
+
+### "TorchScript trace failed"
+
+If `dp --pt freeze --legacy-gpu` fails with a TorchScript trace error, the
+most common cause is an unsupported operation in the model's forward pass.
+Check that:
+
+- You are using a clean training checkpoint (not a partially compiled or
+  Triton-modified model). Reload from `model.ckpt.pt` if needed.
+- `DP_COMPILE_INFER` is unset and `model.use_compile` is `false`.
+- `DP_TRITON_INFER` is `0` (the default).
+
+### Verify the frozen `.pth` model
+
+Before using the frozen model in LAMMPS, test it with `dp --pt test`:
+
+```bash
+dp --pt test -m frozen_model.pth -s system/
+```
+
+This should produce energies and forces that match the original checkpoint
+within numerical round-off. If the test fails or produces NaN, re-freeze from
+a clean checkpoint.
+
+### LAMMPS loads the model but crashes at the first step
+
+This usually means the pair coefficient mapping in LAMMPS does not match the
+model's `type_map`. Verify with:
+
+```bash
+dp --pt show frozen_model.pth
+```
+
+The printed `type_map` must match the element order in the LAMMPS
+`pair_coeff` line. For example, if the model's type map is `["O", "H"]`,
+the LAMMPS input must be:
+
+```lammps
+pair_style deepmd frozen_model.pth
+pair_coeff * * O H
+```
+
+## 10. Why this design
 
 The dense float32 reference path is the same one DeePMD-kit uses to validate
 the optimized kernels for numerical correctness, so running it on a legacy GPU

@@ -435,10 +435,11 @@ and the complete list of boundaries and limitations.
 
 ## Export and running in LAMMPS
 
-### Freeze to `.pt2`
+### Freeze to `.pt2` (standard, recommended for Volta+)
 
-DPA4/SeZM checkpoints use the PyTorch `.pt2` (AOTInductor) export path; the
-ordinary TorchScript freeze path is not used. Run the standard freeze command:
+DPA4/SeZM checkpoints default to the PyTorch `.pt2` (AOTInductor) export path,
+which produces Triton-fused kernels for the fastest inference on Volta (`sm_70`)
+and newer GPUs. Run the standard freeze command:
 
 ```bash
 dp --pt freeze -c model.ckpt.pt -o frozen_model
@@ -446,22 +447,48 @@ dp --pt freeze -c model.ckpt.pt -o frozen_model
 
 The PyTorch backend detects DPA4/SeZM and writes `frozen_model.pt2`.
 
+### Freezing for Legacy GPUs (Pascal/P100, `sm_60`)
+
+If you need to run DPA-4 in LAMMPS on a Pascal GPU (e.g., Tesla P100, `sm_60`),
+use the `--legacy-gpu` flag to produce a TorchScript `.pth` file instead of
+`.pt2`:
+
+```bash
+dp --pt freeze --legacy-gpu -c model.ckpt.pt -o frozen_model.pth
+```
+
+This path uses `make_fx` + TorchScript (`torch.jit.trace`) instead of
+AOTInductor, so it **does not require Triton** and works on any CUDA GPU.
+The resulting `.pth` file loads through the standard `DeepPotPT` loader in
+LAMMPS, the same as any other `.pth` frozen model.
+
+:::{note}
+**Performance trade-off:** The `.pth` path is typically 1.5–3× slower than
+`.pt2` on Volta+ because it lacks Triton-fused kernels, but it is fully
+GPU-accelerated. On Volta+ GPUs, prefer the standard `.pt2` freeze. On
+Pascal, `.pth` is the only option.
+:::
+
+See [Install and run on legacy NVIDIA GPUs](../install/install-legacy-gpu.md)
+for the complete workflow on Pascal/P100, including training, freezing, and
+troubleshooting.
+
 ### Single GPU
 
-Use the frozen `.pt2` with the `deepmd` pair style. A small example is in
+Use the frozen model with the `deepmd` pair style. A small example is in
 `examples/water/dpa4/lmp/`.
 
 ```lammps
-pair_style deepmd frozen_model.pt2
+pair_style deepmd frozen_model.pt2   # or frozen_model.pth for legacy GPUs
 pair_coeff * * O H
 ```
 
 ### Multi-GPU (MPI) inference
 
-The exported `.pt2` runs across multiple GPUs in LAMMPS using MPI domain
-decomposition. Multi-GPU support is built into the package by `dp --pt freeze`,
-so no extra freeze options are needed and the same `.pt2` file serves both
-single- and multi-GPU runs.
+The exported model runs across multiple GPUs in LAMMPS using MPI domain
+decomposition. Multi-GPU support is built into the package by `dp --pt freeze`
+(both `.pt2` and `.pth` paths), so no extra freeze options are needed and
+the same file serves both single- and multi-GPU runs.
 
 Launch LAMMPS with one MPI rank per GPU and make the target devices visible:
 
@@ -608,7 +635,8 @@ closed over the one-hop neighbor shell.
 ## Limitations
 
 - DPA4/SeZM is implemented for the PyTorch backend only.
-- Export uses `.pt2` (AOTInductor); the TorchScript freeze path is not used.
+- Export uses `.pt2` (AOTInductor) by default; a `.pth` (TorchScript) freeze
+  path is available for legacy GPUs via `dp --pt freeze --legacy-gpu`.
 - Model compression is not supported.
 - Multi-GPU (MPI) LAMMPS inference is supported for the plain energy model;
   ZBL zone bridging and spin models run on a single MPI rank.
