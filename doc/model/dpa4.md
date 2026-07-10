@@ -407,6 +407,32 @@ Because bf16 AMP substantially reduces the activation memory footprint, very
 large device memory is usually less important than fp32 FLOPS and bf16 support
 once the target system and batch size fit.
 
+#### Older GPUs (Pascal / Volta / Turing, e.g. Tesla P100 `sm_60`)
+
+DPA4/SeZM runs on pre-Ampere GPUs through its **dense float32 eager reference
+path**, which needs no bfloat16, no Triton, and no `torch.compile`. Two tiers
+matter:
+
+- **bfloat16/TF32 (needs Ampere `sm_80+`):** Pascal (`sm_60`), Volta
+  (`sm_70`), and Turing (`sm_75`) lack native bf16, so `descriptor.use_amp`
+  / `DP_AMP_INFER` is auto-disabled with a one-time warning; use the fp32
+  dense path (or the fp32 `.pt2` on Volta/Turing).
+- **Triton / `torch.compile` / `.pt2` freeze / LAMMPS (needs Volta
+  `sm_70+`):** Triton (shipped with PyTorch 2.11/2.12) supports Volta and
+  newer but **cannot compile for Pascal (`sm_60`)** (AOTInductor is
+  confirmed broken on P100). So on Pascal, `dp --pt freeze` to `.pt2`,
+  `torch.compile` (`model.use_compile` / `DP_COMPILE_INFER`), Triton kernels
+  (`DP_TRITON_INFER`), and DPA-4 LAMMPS inference are **unavailable** and
+  fail fast with an actionable message. **Volta (V100, confirmed by testing)
+  and Turing (expected) support `.pt2` freeze and LAMMPS DPA-4** (only bf16
+  stays off there).
+
+Training, `dp --pt test`, and the ASE calculator work on all of these by
+loading the `.pt` checkpoint directly (no freeze needed). Keep
+`DP_TRITON_INFER=0` (the default) on Pascal. See [Install and run on legacy
+NVIDIA GPUs](../install/install-legacy-gpu.md) for a full install + run guide
+and the complete list of boundaries and limitations.
+
 ## Export and running in LAMMPS
 
 ### Freeze to `.pt2`

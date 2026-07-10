@@ -9,6 +9,7 @@ Installation
    install-from-c-library
    install-lammps
    install-ipi
+   install-legacy-gpu
    build-conda
    install-nodejs
    easy-install-dev

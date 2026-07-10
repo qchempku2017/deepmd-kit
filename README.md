@@ -98,6 +98,43 @@ Then, read on for a brief overview of the usage of DeePMD-kit. You may start wit
 dp
 ```
 
+## Running on older NVIDIA GPUs (e.g. Tesla P100)
+
+DPA-4 / SeZM runs on pre-Ampere NVIDIA cards through its **dense float32
+eager path** — pure PyTorch (`bmm`/`einsum`/`index_add`), no bfloat16, no
+Triton, no `torch.compile`. `dp --pt train`, `dp --pt test`, and the ASE
+calculator all work by loading the `.pt` checkpoint directly; bfloat16 AMP
+(`descriptor.use_amp`, which defaults on) is **auto-disabled** on cards
+without native bf16.
+
+There are two tiers to keep straight:
+
+- **No native bfloat16 (Pascal `sm_60` / P100, Volta `sm_70` / V100, Turing
+  `sm_75`):** bfloat16 autocast is auto-disabled (no native bf16). Use the
+  fp32 dense path (or the fp32 `.pt2` on Volta/Turing).
+- **Triton / AOTInductor unsupported (Pascal `sm_60` only):** Triton (shipped
+  with PyTorch 2.11/2.12) cannot compile for Pascal, so on P100
+  `dp --pt freeze` to `.pt2`, `torch.compile`, Triton kernels, and LAMMPS
+  DPA-4 inference are **unavailable** and fail fast with an actionable
+  message. **Volta (V100) supports `.pt2` freeze and LAMMPS DPA-4 (confirmed
+  by testing); Turing is expected but unverified.**
+
+```sh
+dp --pt train input.json          # set descriptor.use_amp=false on pre-Ampere GPUs (auto-handled)
+dp --pt test -m model.ckpt.pt -s system/
+```
+
+```python
+from deepmd.calculator import DP
+calc = DP(model="model.ckpt.pt")   # ASE calculator, pure eager, no Triton
+```
+
+**Does not work on Pascal (`sm_60`):** `dp --pt freeze` to `.pt2`, DPA-4
+inference through LAMMPS, `torch.compile`, Triton/CuTe fused kernels, bfloat16
+autocast. Older DP / DPA-1 / DPA-2 / DPA-3 models are unaffected (their C++
+ops compile for `sm_60`). See the full guide: [Install and run on legacy
+NVIDIA GPUs](./doc/install/install-legacy-gpu.md).
+
 ## Code structure
 
 The code is organized as follows:

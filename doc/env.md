@@ -128,3 +128,14 @@ Tips:
 - Large runs can generate sizable JSON files; consider limiting numbers of MD steps, like 20.
 - Currently this feature only supports single process, or multi-process runs where each process uses a distinct GPU on the same node.
 :::
+
+## DPA-4 / SeZM (PyTorch backend)
+
+These variables control the opt-in accelerated paths of the DPA-4 / SeZM descriptor (`dpa4.md` describes the precision/performance trade-offs). On **legacy GPUs** (pre-Ampere, e.g. Tesla P100 `sm_60`) the safe path is to leave them all at their defaults, which selects the dense float32 eager reference path. See [Install and run on legacy NVIDIA GPUs](./install/install-legacy-gpu.md).
+
+:::{envvar} DP_FREEZE_FORCE_AOTI
+
+**Choices**: `0`, `1`; **Default**: `0`
+
+{{ pytorch_icon }} Override the Pascal guard on `dp --pt freeze` for DPA-4 / SeZM. The `.pt2` freeze lowers the model through AOTInductor / Triton, which cannot compile for Pascal (`sm_60`); by default `dp --pt freeze` fails fast on Pascal with an actionable message instead of crashing inside Triton. Volta (`sm_70`) and newer support the `.pt2` freeze and LAMMPS DPA-4 normally and are unaffected by this guard. Set this to `1` to attempt the AOTInductor freeze on Pascal anyway — only useful with a custom Triton build that supports the device. No `.pt2` is needed for ASE or `dp --pt test`; load the `.pt` checkpoint directly.
+:::
