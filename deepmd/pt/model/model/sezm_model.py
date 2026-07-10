@@ -492,6 +492,9 @@ from deepmd.pt.model.model.transform_output import (
 from deepmd.pt.utils import (
     env,
 )
+from deepmd.kernels.utils import (
+    assert_triton_supported_gpu,
+)
 from deepmd.pt.utils.compile_compat import (
     AM_PREFIX,
     FIT_PREFIX,
@@ -714,6 +717,11 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         # LoRA injection happens in Trainer.__init__ after pre-trained state is loaded.
         self.lora_config: dict[str, Any] | None = None if lora is None else dict(lora)
         self._dens_compiled = False
+        # Whether the one-time Pascal/Triton fail-fast check for the compile
+        # path has already run for this instance (checked in should_use_compile
+        # against the model's real runtime device). Per-instance, never
+        # process-global, so capability tests on a fresh model are respected.
+        self._compile_check_done = False
         self._core_compute_pending_compile_t0: float | None = None
         self._core_compute_pending_compile_key: tuple[bool, bool] | None = None
         self._dens_pending_compile_t0: float | None = None
@@ -753,8 +761,14 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 f"DP_TF32_INFER must be one of 0/1/2, got {tf32_infer_env!r}"
             )
         self._tf32_infer_precision = _TF32_INFER_PRECISION_CHOICES[tf32_infer_env]
-        if self._env_use_compile_infer is True:
+        # Fail fast at construction for *both* the inference compile flag
+        # (DP_COMPILE_INFER) and the training compile flag (use_compile): the
+        # torch.compile path lowers through Triton, unsupported on Pascal.
+        # env.DEVICE is the best device available before parameters are placed;
+        # should_use_compile re-checks against the model's real runtime device.
+        if self._env_use_compile_infer is True or self.use_compile:
             check_compile_torch_version()
+            assert_triton_supported_gpu(env.DEVICE)
 
         # === Bridging (optional short-range zone bridging) ===
         self.bridging_method: str = str(bridging_method).upper()
@@ -2396,10 +2410,31 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         self._dens_pending_compile_t0 = _compile_t0
 
     def should_use_compile(self) -> bool:
-        """Return whether the current forward should use the compile path."""
+        """Return whether the current forward should use the compile path.
+
+        Raises ``RuntimeError`` on Pascal GPUs (sm_60): the ``torch.compile``
+        / AOTInductor path lowers through Triton, which cannot compile for
+        Pascal (AOTInductor is confirmed broken on sm_60). Volta (sm_70) and
+        newer are supported. Use the dense eager path instead on Pascal.
+        """
         if self.training:
-            return self.use_compile
-        return bool(self._env_use_compile_infer)
+            want = self.use_compile
+        else:
+            want = bool(self._env_use_compile_infer)
+        if want and not self._compile_check_done:
+            # Check once against the model's actual runtime device (not the
+            # import-time env.DEVICE), so a model moved after construction --
+            # or one built before CUDA was initialized -- is checked against
+            # the device it really runs on. Per-instance flag (never a
+            # process-global cache) so capability tests on a fresh model are
+            # respected. Raises on Pascal; no-op on CPU (Inductor cpp
+            # backend) and Volta+.
+            param = next(self.parameters(), None)
+            assert_triton_supported_gpu(
+                param.device if param is not None else env.DEVICE
+            )
+            self._compile_check_done = True
+        return want
 
     def _inductor_compile_options(self, *, inference: bool = False) -> dict[str, Any]:
         """Return the Inductor lowering options for this model's compiled core.

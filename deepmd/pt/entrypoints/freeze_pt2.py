@@ -47,6 +47,8 @@ from deepmd.dpmodel.utils.region import (
     normalize_coord,
 )
 from deepmd.kernels.utils import (
+    cuda_compute_capability,
+    gpu_capability_description,
     triton_infer_level,
 )
 from deepmd.pt.model.descriptor.sezm_nn.so2 import (
@@ -859,6 +861,53 @@ def freeze_sezm_to_pt2(
     from torch._inductor import config as inductor_config
 
     target_device = device if device is not None else DEVICE
+
+    # AOTInductor lowers the SeZM graph through Triton *on CUDA targets*. Triton
+    # (shipped with PyTorch 2.11/2.12) supports Volta (sm_70) and newer but
+    # cannot compile for Pascal (sm_60/sm_62) -- AOTInductor is confirmed broken
+    # there. Fail fast on a Pascal CUDA target with an actionable message instead
+    # of crashing inside the Triton compiler several minutes into the freeze.
+    # Volta/Turing/Ampere+ CUDA targets are unaffected. CPU targets are also
+    # unaffected: AOTInductor uses the Inductor cpp backend there (no Triton),
+    # and ``freeze_sezm_to_pt2`` already special-cases ``type == "cpu"``. The
+    # SeZM `.pt` checkpoint is already ASE / `dp --pt test` loadable in pure
+    # eager mode, so no freeze is needed for Python inference; LAMMPS DPA4/SeZM
+    # requires a Volta-or-newer GPU. `DP_FREEZE_FORCE_AOTI=1` is an escape hatch
+    # for a custom Triton build that does support a Pascal device.
+    force_aoti = os.environ.get("DP_FREEZE_FORCE_AOTI", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if target_device.type == "cuda" and not force_aoti:
+        cap = cuda_compute_capability(target_device)
+        if cap is None:
+            # The capability query failed (out-of-range device index or a
+            # driver issue) -- distinct from a genuine Pascal device. Fail
+            # fast with a precise message instead of a misleading "Pascal" one.
+            raise RuntimeError(
+                f"Cannot freeze DPA4/SeZM to .pt2 for CUDA device "
+                f"{target_device}: its compute capability could not be "
+                f"queried (the device index may be out of range or the CUDA "
+                f"driver is unavailable). AOTInductor needs a CUDA device it "
+                f"can target. For ASE / `dp --pt test` inference, load the "
+                f"`.pt` checkpoint directly (no freeze needed)."
+            )
+        if cap[0] < 7:
+            raise RuntimeError(
+                f"Cannot freeze DPA4/SeZM to .pt2 on a Pascal CUDA GPU "
+                f"({gpu_capability_description(target_device)}): the AOTInductor "
+                f"freeze lowers through Triton, which cannot compile for Pascal "
+                f"(sm_60); AOTInductor is confirmed broken there. Volta (sm_70) "
+                f"and newer are supported. For ASE / `dp --pt test` inference, "
+                f"load the `.pt` checkpoint directly -- no freeze is needed, and "
+                f"the dense eager path runs on any CUDA device PyTorch itself "
+                f"supports. For LAMMPS, DPA4/SeZM requires a Volta-or-newer GPU "
+                f"(sm_70+). Set DP_FREEZE_FORCE_AOTI=1 to attempt the AOTInductor "
+                f"freeze anyway (only if you know your Triton build supports this "
+                f"device)."
+            )
 
     raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict, params = _extract_state_and_params(raw)

@@ -23,8 +23,10 @@ from deepmd.dpmodel.utils.seed import (
     child_seed,
 )
 from deepmd.kernels.utils import (
+    cuda_supports_triton,
     triton_infer_level,
     use_cute_infer,
+    warn_legacy_gpu_once,
 )
 from deepmd.pt.utils import (
     env,
@@ -1188,6 +1190,21 @@ class SO2Convolution(nn.Module):
         # unsupported.
         self.triton_infer_level = triton_infer_level()
         self.use_triton_infer = self.triton_infer_level >= 1
+        # Triton is unsupported on Pascal (sm_60): AOTInductor is confirmed
+        # broken there, and the runtime ``@triton.jit`` kernels share the same
+        # device codegen and are very likely to fail at first launch too. Volta
+        # (sm_70) and newer run Triton normally. Warn once on Pascal and leave
+        # the decision to the user rather than hard-failing, so experiments
+        # against a custom Triton build are not blocked.
+        if self.use_triton_infer and not cuda_supports_triton(env.DEVICE):
+            warn_legacy_gpu_once(
+                "DP_TRITON_INFER>=1 selects Triton SeZM kernels, which are "
+                "unsupported on Pascal (sm_60) and older (requires Volta "
+                "sm_70+); the kernels will very likely fail at first launch. "
+                "Set DP_TRITON_INFER=0 (the default) to use the dense float32 "
+                "reference path.",
+                device=env.DEVICE,
+            )
         self.use_cute_infer = use_cute_infer()
         if self.use_triton_infer and self.use_cute_infer:
             raise ValueError(

@@ -52,7 +52,9 @@ from deepmd.dpmodel.utils.seed import (
     child_seed,
 )
 from deepmd.kernels.utils import (
+    cuda_supports_bf16,
     use_amp_infer,
+    warn_legacy_gpu_once,
 )
 from deepmd.pt.utils import (
     env,
@@ -2193,6 +2195,32 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             or device.type != "cuda"
             or (not self.training and not self.use_amp_infer)
         ):
+            yield
+            return
+
+        # Legacy GPUs (Pascal sm_60, Volta sm_70, Turing sm_75) lack native
+        # bfloat16; torch.autocast(bfloat16) raises or silently degrades on
+        # them. Auto-disable AMP with a one-time warning so the dense float32
+        # path is used instead, keeping SeZM training/inference correct on
+        # legacy hardware without forcing every user to set use_amp=False by
+        # hand. This is a no-op on CPU and on bf16-capable (Ampere+) GPUs.
+        # The bf16 support for the descriptor's (single, fixed) device is
+        # resolved once and cached on the instance, so the hot forward loop
+        # pays an attribute read rather than a driver query; per-instance (not
+        # process-global) so tests that mock torch.cuda.get_device_capability
+        # on a fresh model are respected.
+        bf16_supported = getattr(self, "_dp_bf16_supported", None)
+        if bf16_supported is None:
+            bf16_supported = cuda_supports_bf16(device)
+            self._dp_bf16_supported = bf16_supported
+        if not bf16_supported:
+            warn_legacy_gpu_once(
+                "Disabling bfloat16 autocast (use_amp) for the SeZM "
+                "descriptor; the dense float32 reference path will be used "
+                "instead. Set descriptor.use_amp=false to silence this "
+                "warning.",
+                device=device,
+            )
             yield
             return
 
