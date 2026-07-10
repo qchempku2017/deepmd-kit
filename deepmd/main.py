@@ -360,6 +360,16 @@ def main_parser() -> argparse.ArgumentParser:
         "(NeighborGraph edge-list lower; only for graph-eligible models, currently "
         "dpa1 with attn_layer=0). 'graph' selects the C++ graph inference path.",
     )
+    parser_frz.add_argument(
+        "--legacy-gpu",
+        action="store_true",
+        default=False,
+        help="(Supported backend: PyTorch) Freeze DPA4/SeZM to a TorchScript .pth "
+        "file instead of the default .pt2 (AOTInductor) archive. The .pth format "
+        "works on legacy GPUs (Pascal/P100, sm_60) where Triton/AOTInductor is "
+        "unavailable. Ignored for non-SeZM checkpoints (they always use the "
+        "standard .pth freeze path).",
+    )
 
     # * test script ********************************************************************
     parser_tst = subparsers.add_parser(

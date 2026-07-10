@@ -76,6 +76,9 @@ from deepmd.utils.model_branch_dict import (
 
 log = logging.getLogger(__name__)
 
+# Fixed nloc used for sample inputs during .pth freeze tracing.
+_PTH_SAMPLE_NLOC = 7
+
 
 def _model_has_spin(model: torch.nn.Module) -> bool:
     """Return whether ``model`` uses the spin lower interface."""
@@ -126,6 +129,200 @@ def _strip_shape_assertions(graph_module: torch.nn.Module) -> None:
             graph.erase_node(node)
     graph.eliminate_dead_code()
     graph_module.recompile()
+
+
+def _log_dpa4_citation() -> None:
+    """Log the DPA-4 paper citation BibTeX."""
+    log.info(
+        "Thank you for using the DPA4/SeZM model! If it benefits your "
+        "research, please cite the DPA4 paper "
+        "(https://arxiv.org/abs/2606.02419):"
+    )
+    log.info(
+        "\n"
+        "@article{li2026dpa4,\n"
+        "  title = {{DPA4}: Pushing the Accuracy-Cost Frontier of Interatomic "
+        "Potentials with {EMFA} {SO(2)} Convolution},\n"
+        "  author = {Li, Tiancheng and Li, Wentao and Peng, Anyang and "
+        "Xue, Jianming and Zhang, Linfeng and Zhang, Duo and Wang, Han},\n"
+        "  journal = {arXiv preprint arXiv:2606.02419},\n"
+        "  year = {2026},\n"
+        "  eprint = {2606.02419},\n"
+        "  archivePrefix = {arXiv},\n"
+        "  primaryClass = {physics.chem-ph},\n"
+        "  doi = {10.48550/arXiv.2606.02419},\n"
+        "  url = {https://arxiv.org/abs/2606.02419}\n"
+        "}"
+    )
+
+
+def _build_edge_schema_ts(
+    fnlist: torch.Tensor,
+    extended_coord: torch.Tensor,
+    nloc: int,
+    nnei: int,
+) -> tuple[torch.Tensor, ...]:
+    """Build edge schema tensors from a LAMMPS-format neighbour list.
+
+    This function is callable from within a TorchScript-traced
+    ``forward_lower`` (unlike ``edge_schema_from_extended``, which returns a
+    namedtuple that the tracer cannot follow across module boundaries).  The
+    logic must stay in sync with ``edge_schema_from_extended`` in
+    ``deepmd.pt_expt.utils.edge_schema``.
+
+    Returns a tuple ``(edge_index, edge_vec, edge_scatter_index, edge_mask,
+    nf)``.  The caller is responsible for extracting ``edge_src`` / ``edge_dst``
+    or ``dst_coord`` as needed from the index tensors.
+    """
+    nf = fnlist.shape[0]
+    neighbor_flat = fnlist.reshape(-1)
+    dst_actual = (
+        torch.arange(neighbor_flat.shape[0], device=fnlist.device, dtype=torch.long)
+        // nnei
+    )
+    valid_flat = neighbor_flat >= 0
+    neighbor_safe = torch.where(
+        valid_flat, neighbor_flat, torch.zeros_like(neighbor_flat)
+    )
+    neighbor_safe_2d = neighbor_safe.to(dtype=torch.long).view(nf, nloc * nnei)
+    # Gather neighbour coordinates.
+    neighbor_coord = torch.gather(
+        extended_coord,
+        1,
+        neighbor_safe_2d.unsqueeze(-1).expand(-1, -1, 3),
+    ).reshape(-1, 3)
+    # Gather destination (central atom) coordinates.
+    dst_local = dst_actual % nloc
+    dst_coord = torch.gather(
+        extended_coord,
+        1,
+        dst_local.view(nf, nloc * nnei).unsqueeze(-1).expand(-1, -1, 3),
+    ).reshape(-1, 3)
+    edge_vec = neighbor_coord - dst_coord
+    edge_index = torch.stack([neighbor_safe, dst_actual], dim=0)
+    edge_scatter_index = edge_index
+    edge_mask = valid_flat
+    return (edge_index, edge_vec, edge_scatter_index, edge_mask, nf)
+
+
+def _validate_edge_schema_sync(
+    ext_coord: torch.Tensor,
+    ext_atype_local: torch.Tensor,
+    formatted_nlist: torch.Tensor,
+    mapping: torch.Tensor,
+) -> None:
+    """Verify that ``_build_edge_schema_ts`` and ``edge_schema_from_extended``
+    produce identical tensors for the same inputs.
+
+    The two functions must stay in sync; this function is called from
+    ``freeze_sezm_to_pth``.  A shape-only comparison runs **unconditionally**
+    on every freeze (it is cheap).  Full tensor equality is gated by the
+    ``DP_FREEZE_VALIDATE_EDGE_SCHEMA`` environment variable because it requires
+    materialising both edge schemas in memory.  Raises ``AssertionError`` on
+    mismatch.
+    """
+    validate_values = os.environ.get(
+        "DP_FREEZE_VALIDATE_EDGE_SCHEMA", ""
+    ).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    try:
+        ref_schema = edge_schema_from_extended(
+            ext_coord, ext_atype_local, formatted_nlist, mapping
+        )
+    except Exception as exc:
+        log.warning(
+            "Edge-schema sync check: edge_schema_from_extended raised %s; "
+            "skipping validation.",
+            exc,
+        )
+        return
+
+    # Compute via _build_edge_schema_ts.
+    nloc = int(ext_atype_local.shape[1])
+    nnei = int(formatted_nlist.shape[2])
+    ts_result = _build_edge_schema_ts(formatted_nlist, ext_coord, nloc, nnei)
+    ts_edge_index, ts_edge_vec, ts_edge_scatter_index, ts_edge_mask, ts_nf = ts_result
+
+    # --- unconditional shape check ---
+    shape_errors: list[str] = []
+    for name, ts_val, ref_val in (
+        ("edge_index", ts_edge_index, ref_schema.edge_index),
+        ("edge_vec", ts_edge_vec, ref_schema.edge_vec),
+        (
+            "edge_scatter_index",
+            ts_edge_scatter_index,
+            ref_schema.edge_scatter_index,
+        ),
+        ("edge_mask", ts_edge_mask, ref_schema.edge_mask),
+    ):
+        if ts_val.shape != ref_val.shape:
+            shape_errors.append(
+                f"  {name}: shape mismatch TS={tuple(ts_val.shape)} "
+                f"ref={tuple(ref_val.shape)}"
+            )
+
+    if shape_errors:
+        msg = (
+            "Edge-schema sync check FAILED (shape): _build_edge_schema_ts and "
+            "edge_schema_from_extended diverged!\n"
+            + "\n".join(shape_errors)
+            + "\nThis is a bug -- the .pth freeze may produce incorrect results. "
+            "Please report it."
+        )
+        log.error(msg)
+        raise AssertionError(msg)
+
+    # --- opt-in value check ---
+    if not validate_values:
+        log.info(
+            "Edge-schema shape check passed: _build_edge_schema_ts shapes match "
+            "edge_schema_from_extended for nloc=%d, nnei=%d.  "
+            "Set DP_FREEZE_VALIDATE_EDGE_SCHEMA=1 for a full value comparison.",
+            nloc,
+            nnei,
+        )
+        return
+
+    value_errors: list[str] = []
+    for name, ts_val, ref_val in (
+        ("edge_index", ts_edge_index, ref_schema.edge_index),
+        ("edge_vec", ts_edge_vec, ref_schema.edge_vec),
+        (
+            "edge_scatter_index",
+            ts_edge_scatter_index,
+            ref_schema.edge_scatter_index,
+        ),
+        ("edge_mask", ts_edge_mask, ref_schema.edge_mask),
+    ):
+        if not bool(torch.equal(ts_val, ref_val.to(device=ts_val.device))):
+            max_diff = float(
+                (ts_val.float() - ref_val.float().to(ts_val.device)).abs().max()
+            )
+            value_errors.append(
+                f"  {name}: values differ (max abs diff={max_diff:.2e})"
+            )
+
+    if value_errors:
+        msg = (
+            "Edge-schema sync check FAILED (values): _build_edge_schema_ts and "
+            "edge_schema_from_extended diverged!\n"
+            + "\n".join(value_errors)
+            + "\nThis is a bug -- the .pth freeze may produce incorrect results. "
+            "Please report it."
+        )
+        log.error(msg)
+        raise AssertionError(msg)
+    log.info(
+        "Edge-schema sync check passed (shapes + values): "
+        "_build_edge_schema_ts matches edge_schema_from_extended "
+        "for nloc=%d, nnei=%d.",
+        nloc,
+        nnei,
+    )
 
 
 def _extract_state_and_params(
@@ -216,6 +413,31 @@ def _select_model_head(
         if key.startswith(prefix):
             branch_state[key.replace(prefix, "model.Default.")] = value
     return branch_state, branch_params
+
+
+def _load_sezm_checkpoint(
+    ckpt_path: str,
+    head: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], torch.nn.Module]:
+    """Load a SeZM/DPA4 checkpoint and return (state_dict, params, model).
+
+    Shared by both ``freeze_sezm_to_pt2`` and ``freeze_sezm_to_pth`` so that
+    checkpoint loading and head selection logic stays in one place.
+    """
+    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict, params = _extract_state_and_params(raw)
+    state_dict, params = _select_model_head(state_dict, params, head)
+
+    model_type = str(params.get("type", "")).lower()
+    if model_type not in ("sezm", "dpa4"):
+        raise ValueError(
+            f"Expected a SeZM/DPA4 checkpoint, got type={params.get('type')!r}."
+        )
+    model = get_model(params)
+    ModelWrapper(model).load_state_dict(state_dict)
+    model.eval()
+    model.to("cpu")
+    return state_dict, params, model
 
 
 def _to_py_list(value: Any) -> Any:
@@ -900,30 +1122,20 @@ def freeze_sezm_to_pt2(
                 f"({gpu_capability_description(target_device)}): the AOTInductor "
                 f"freeze lowers through Triton, which cannot compile for Pascal "
                 f"(sm_60); AOTInductor is confirmed broken there. Volta (sm_70) "
-                f"and newer are supported. For ASE / `dp --pt test` inference, "
+                f"and newer are supported. "
+                f"Use freeze_sezm_to_pth() or `dp --pt freeze --legacy-gpu` to "
+                f"freeze to a TorchScript .pth file instead -- the .pth format "
+                f"works on Pascal/P100 GPUs with no Triton dependency. "
+                f"For ASE / `dp --pt test` inference, "
                 f"load the `.pt` checkpoint directly -- no freeze is needed, and "
                 f"the dense eager path runs on any CUDA device PyTorch itself "
-                f"supports. For LAMMPS, DPA4/SeZM requires a Volta-or-newer GPU "
-                f"(sm_70+). Set DP_FREEZE_FORCE_AOTI=1 to attempt the AOTInductor "
+                f"supports. Set DP_FREEZE_FORCE_AOTI=1 to attempt the AOTInductor "
                 f"freeze anyway (only if you know your Triton build supports this "
                 f"device)."
             )
 
-    raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict, params = _extract_state_and_params(raw)
-    state_dict, params = _select_model_head(state_dict, params, head)
-
-    model_type = str(params.get("type", "")).lower()
-    if model_type not in ("sezm", "dpa4"):
-        raise ValueError(
-            f"freeze_sezm_to_pt2 expects a SeZM/DPA4 checkpoint, got type={params.get('type')!r}."
-        )
-
-    model = get_model(params)
+    _state_dict, params, model = _load_sezm_checkpoint(ckpt_path, head)
     is_spin = _model_has_spin(model)
-    ModelWrapper(model).load_state_dict(state_dict)
-    model.eval()
-    model.to("cpu")
 
     # The SO(2) linear mixer selects its block-diagonal vs dense matmul from a
     # Python device branch that make_fx resolves at trace time. Since tracing
@@ -1038,30 +1250,615 @@ def freeze_sezm_to_pt2(
         target_device,
         output_keys,
     )
+    _log_dpa4_citation()
+
+
+class SeZMPTHModel(torch.nn.Module):
+    """TorchScript-compatible wrapper for a SeZM frozen .pth model.
+
+    Exposes ``forward_lower`` with the standard LAMMPS contract so
+    ``DeepPotPT`` can load and call it.  The edge-level compute graph
+    (from ``make_fx``) is stored as a sub-module and invoked after
+    converting the LAMMPS neighbour list to the edge schema.
+
+    Parameters
+    ----------
+    lower_graph
+        The ``make_fx``-traced lower graph (edge-level).
+    metadata
+        All model metadata values needed by the public API and
+        ``forward_lower`` post-processing.
+    """
+
+    def __init__(
+        self,
+        lower_graph: torch.nn.Module,
+        *,
+        sel: list[int],
+        rcut: float,
+        ntypes: int,
+        type_map: list[str],
+        nnei: int,
+        nsel: int,
+        dim_fparam: int,
+        dim_aparam: int,
+        dim_chg_spin: int,
+        has_mp: bool,
+        min_nbor_dist: float | None,
+        model_def_json: str,
+        model_output_types: list[str],
+        has_default_fparam: bool,
+        default_fparam: list[float] | None,
+        default_chg_spin: list[float] | None,
+        mixed_types: bool,
+        is_spin: bool,
+        ntypes_spin: int,
+        use_spin: list[bool],
+        lower_input_kind: str,
+        lower_nf: int,
+        do_grad_r: bool,
+        do_grad_c: bool,
+    ) -> None:
+        super().__init__()
+        self.lower_graph = lower_graph
+        self._rcut = rcut
+        self._ntypes = ntypes
+        self._sel = sel
+        self._type_map = type_map
+        self._nnei = nnei
+        self._nsel = nsel
+        self._dim_fparam = dim_fparam
+        self._dim_aparam = dim_aparam
+        self._dim_chg_spin = dim_chg_spin
+        self._has_mp = has_mp
+        self._min_nbor_dist = min_nbor_dist
+        self._model_def_json = model_def_json
+        self._model_output_types = model_output_types
+        self._has_default_fparam = has_default_fparam
+        self._default_fparam = default_fparam
+        self._default_chg_spin = default_chg_spin
+        self._mixed_types = mixed_types
+        self._is_spin = is_spin
+        self._ntypes_spin = ntypes_spin
+        self._use_spin = use_spin
+        self._lower_input_kind = lower_input_kind
+        self._lower_nf = lower_nf
+        self._do_grad_r = do_grad_r
+        self._do_grad_c = do_grad_c
+
+    @torch.jit.export
+    def get_rcut(self) -> float:
+        return self._rcut
+
+    @torch.jit.export
+    def get_ntypes(self) -> int:
+        return self._ntypes
+
+    @torch.jit.export
+    def get_sel(self) -> list[int]:
+        return self._sel
+
+    @torch.jit.export
+    def get_type_map(self) -> list[str]:
+        return self._type_map
+
+    @torch.jit.export
+    def get_nnei(self) -> int:
+        return self._nnei
+
+    @torch.jit.export
+    def get_nsel(self) -> int:
+        return self._nsel
+
+    @torch.jit.export
+    def get_dim_fparam(self) -> int:
+        return self._dim_fparam
+
+    @torch.jit.export
+    def get_dim_aparam(self) -> int:
+        return self._dim_aparam
+
+    @torch.jit.export
+    def is_aparam_nall(self) -> bool:
+        return False
+
+    @torch.jit.export
+    def has_message_passing(self) -> bool:
+        return self._has_mp
+
+    @torch.jit.export
+    def get_dim_chg_spin(self) -> int:
+        return self._dim_chg_spin
+
+    @torch.jit.export
+    def get_min_nbor_dist(self) -> float | None:
+        return self._min_nbor_dist
+
+    @torch.jit.export
+    def get_model_def_script(self) -> str:
+        return self._model_def_json
+
+    @torch.jit.export
+    def model_output_type(self) -> list[str]:
+        return self._model_output_types
+
+    @torch.jit.export
+    def has_default_fparam(self) -> bool:
+        return self._has_default_fparam
+
+    @torch.jit.export
+    def get_default_fparam(self) -> torch.Tensor | None:
+        if self._default_fparam is None:
+            return None
+        return torch.tensor(self._default_fparam, dtype=torch.float64)
+
+    @torch.jit.export
+    def get_default_chg_spin(self) -> torch.Tensor | None:
+        if self._default_chg_spin is None:
+            return None
+        return torch.tensor(self._default_chg_spin, dtype=torch.float64)
+
+    @torch.jit.export
+    def mixed_types(self) -> bool:
+        return self._mixed_types
+
+    @torch.jit.export
+    def has_spin(self) -> bool:
+        return self._is_spin
+
+    @torch.jit.export
+    def get_ntypes_spin(self) -> int:
+        return self._ntypes_spin
+
+    @torch.jit.export
+    def get_use_spin(self) -> list[bool]:
+        return self._use_spin
+
+    @torch.jit.export
+    def forward_lower(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor | None = None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        do_atomic_virial: bool = False,
+        comm_dict: dict[str, torch.Tensor] | None = None,
+        charge_spin: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Standard LAMMPS ``forward_lower`` contract.
+
+        Converts the LAMMPS neighbour list to the edge schema, runs the
+        traced lower graph, and post-processes the output into the format
+        expected by ``DeepPotPT``.
+
+        .. note::
+           Only the energy (non-spin) edge ABI is supported by this wrapper.
+           ``DeepPotPT.forward_lower`` does not supply ``extended_spin``,
+           so spin models (native-spin and virtual-spin) are rejected during
+           freezing via ``freeze_sezm_to_pth`` and cannot reach this method.
+        """
+        # --- Step 1: simplified format_nlist (mixed_types=True) ---
+        nf, nloc_val, nsel_in = nlist.shape
+        nnei_target = self._nnei
+        # Pad or truncate nlist to match nnei.
+        if nsel_in < nnei_target:
+            pad = torch.full(
+                (nf, nloc_val, nnei_target - nsel_in),
+                -1,
+                dtype=nlist.dtype,
+                device=nlist.device,
+            )
+            fnlist = torch.cat([nlist, pad], dim=2)
+        elif nsel_in > nnei_target:
+            # Keep nearest nnei_target neighbours (first nnei_target columns).
+            fnlist = nlist[:, :, :nnei_target].contiguous()
+        else:
+            fnlist = nlist
+        # Ensure fnlist is contiguous.
+        fnlist = fnlist.contiguous()
+
+        # --- Step 2: build edge schema via shared helper ---
+        (
+            edge_index,
+            edge_vec,
+            edge_scatter_index,
+            edge_mask,
+            _nf,
+        ) = _build_edge_schema_ts(
+            fnlist, extended_coord, int(nloc_val), int(nnei_target)
+        )
+        dst_coord = extended_coord.gather(
+            1,
+            torch.arange(nloc_val, device=fnlist.device)
+            .view(1, nloc_val, 1)
+            .expand(_nf, nloc_val, 3),
+        )
+
+        # --- Step 3: call the traced lower graph ---
+        atype_local = extended_atype[:, :nloc_val].to(dtype=torch.long)
+        lower_inputs = (
+            dst_coord,
+            atype_local,
+            edge_index.to(dtype=torch.long),
+            edge_vec,
+            edge_scatter_index.to(dtype=torch.long),
+            edge_mask,
+            fparam,
+            aparam,
+            charge_spin,
+        )
+
+        result = self.lower_graph(*lower_inputs)
+
+        # --- Step 4: post-process output ---
+        model_predict: dict[str, torch.Tensor] = {}
+        model_predict["atom_energy"] = result["energy"]
+        model_predict["energy"] = result["energy_redu"]
+        if self._do_grad_r:
+            model_predict["extended_force"] = result["energy_derv_r"].squeeze(-2)
+        if self._do_grad_c:
+            model_predict["virial"] = result["energy_derv_c_redu"].squeeze(-2)
+            if do_atomic_virial:
+                model_predict["extended_virial"] = result["energy_derv_c"].squeeze(-2)
+        return model_predict
+
+
+def freeze_sezm_to_pth(
+    ckpt_path: str,
+    out_path: str,
+    *,
+    device: torch.device | None = None,
+    head: str | None = None,
+    atomic_virial: bool = True,
+) -> None:
+    """Freeze a SeZM checkpoint into a TorchScript ``.pth`` file.
+
+    This path converts the eager lower graph (traced via ``make_fx``) into a
+    TorchScript module that works on **all** CUDA GPUs supported by PyTorch,
+    including Pascal / P100 (sm_60).  No Triton or AOTInductor dependency is
+    required, making this the freeze path for legacy-GPU LAMMPS deployments.
+
+    Supports plain energy SeZM/DPA4 models only.  The exported ``.pth`` is
+    loaded by ``DeepPotPT`` (the standard PyTorch LAMMPS interface) and exposes
+    the same ``forward_lower`` contract as other ``.pth`` energy models.
+
+    .. note::
+       Spin (native-spin and virtual-spin) models are **not** supported by
+       this path because ``DeepPotPT.forward_lower`` does not supply an
+       ``extended_spin`` tensor.  Use ``freeze_sezm_to_pt2`` (``dp --pt
+       freeze`` without ``--legacy-gpu``) for spin models.
+
+    Parameters
+    ----------
+    ckpt_path
+        Path to the SeZM training checkpoint (``.pt``).
+    out_path
+        Destination file.  A ``.pth`` suffix is expected.
+    device
+        Target device.  Defaults to :data:`DEVICE`.  Tracing itself always
+        runs on CPU.
+    head
+        Model head to export from a multi-task checkpoint. If omitted, the
+        ``Default`` head is used when present; otherwise multi-task checkpoints
+        must pass an explicit head. Single-task checkpoints must pass ``None``.
+    atomic_virial
+        Whether the exported model exposes per-atom virial.  Enabled by
+        default: the edge-force scatter assembles the per-atom virial as a
+        free by-product of the single backward pass.
+
+    Environment Variables
+    ---------------------
+    DP_FREEZE_FORCE_PTH
+        Set to ``1`` to force the ``.pth`` freeze path even on Triton-capable
+        GPUs (Volta+), suppressing the performance warning.  Useful for
+        debugging or heterogeneous GPU clusters where TorchScript portability
+        is preferred over peak performance.
+    """
+    target_device = device if device is not None else DEVICE
+
+    # Check for DP_FREEZE_FORCE_PTH env var override.
+    force_pth = os.environ.get("DP_FREEZE_FORCE_PTH", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+    # Warn if Triton-capable GPU is being used for .pth freeze (since .pt2
+    # would be faster), unless the user explicitly forced .pth.
+    if target_device.type == "cuda" and not force_pth:
+        cap = cuda_compute_capability(target_device)
+        if cap is not None and cap[0] >= 7:
+            log.warning(
+                "Freezing DPA4/SeZM to .pth (TorchScript) on a Triton-capable "
+                "GPU (%s). The .pt2 (AOTInductor) path is recommended for this "
+                "hardware as it is typically faster. Set DP_FREEZE_FORCE_PTH=1 "
+                "to suppress this warning.",
+                gpu_capability_description(target_device),
+            )
+
+    _state_dict, params, model = _load_sezm_checkpoint(ckpt_path, head)
+    is_spin = _model_has_spin(model)
+
+    # SeZMPTHModel implements the DeepPotPT.forward_lower contract, which
+    # does not supply an extended_spin tensor.  Spin models must be frozen
+    # via the .pt2 (AOTInductor) path or loaded through DeepSpinPT.
+    if is_spin:
+        raise ValueError(
+            "Spin (native-spin or virtual-spin) SeZM models are not "
+            "supported by the .pth (TorchScript) freeze path.  "
+            "DeepPotPT.forward_lower does not supply an extended_spin "
+            "tensor, which spin models require.  Use the .pt2 freeze path "
+            "(dp --pt freeze without --legacy-gpu) for spin models instead."
+        )
+
+    # Only the energy (non-spin) edge ABI is supported by the .pth freeze
+    # path because DeepPotPT.forward_lower does not supply extended_spin.
+    # (Spin models are rejected above.)
+    _lower_input_kind = "edge"
+
+    # --- Build sample inputs for the lower (edge-level) graph ---
+    _, sample_inputs_cpu = _resolve_nframes(
+        model,
+        nloc=_PTH_SAMPLE_NLOC,
+        device=torch.device("cpu"),
+        has_spin=is_spin,
+    )
+
+    # --- Trace the lower graph via make_fx ---
+    log.info("Tracing the lower graph on CPU (make_fx)...")
+    traced = model.forward_common_lower_exportable(*sample_inputs_cpu)
+
+    with torch.no_grad():
+        sample_out = traced(*sample_inputs_cpu)
+    output_keys = list(sample_out.keys())
+    log.info("Lower graph output keys: %s", output_keys)
+
+    # --- Build sample LAMMPS-level inputs for forward_lower tracing ---
+    ext_tensors = _build_sample_extended(
+        model,
+        nframes=1,
+        nloc=_PTH_SAMPLE_NLOC,
+        device=torch.device("cpu"),
+        has_spin=is_spin,
+    )
+    ext_coord, ext_atype, nlist_t, mapping_t = ext_tensors[:4]
+
+    # --- Pre-compute metadata values (must not reference 'model' in wrapper) ---
+    ntypes = _get_model_ntypes(model)
+    rcut = float(model.get_rcut())
+    sel = [int(s) for s in model.get_sel()]
+    dim_fparam = int(model.get_dim_fparam())
+    dim_aparam = int(model.get_dim_aparam())
+    dim_chg_spin = int(model.get_dim_chg_spin())
+    type_map = list(model.get_type_map())
+    has_mp = _model_has_message_passing(model)
+    nnei = int(sum(sel))
+    nsel_val = nnei
+    do_grad_r = bool(model.do_grad_r("energy"))
+    do_grad_c = bool(model.do_grad_c("energy"))
+    mixed_types_val = bool(model.mixed_types())
+    if not mixed_types_val:
+        raise ValueError(
+            "The .pth (TorchScript) freeze path requires mixed_types=True for "
+            "SeZM/DPA4 models. This model has mixed_types=False. "
+            "Use the .pt2 freeze path (dp --pt freeze without --legacy-gpu) "
+            "instead."
+        )
+    has_default_fparam_val = bool(model.has_default_fparam())
+    default_fparam_val = _to_py_list(model.get_default_fparam())
+    default_chg_spin_val = _to_py_list(model.get_default_chg_spin())
+    min_nbor_dist = model.get_min_nbor_dist()
+    min_nbor_dist_val = float(min_nbor_dist) if min_nbor_dist is not None else None
+    # Spin metadata (only populated for spin models).
+    ntypes_spin_val: int = 0
+    use_spin_val: list[bool] = []
+    if is_spin and hasattr(model, "spin"):
+        try:
+            ntypes_spin_val = int(model.spin.get_ntypes_spin())
+            use_spin_val = [bool(v) for v in model.spin.use_spin]
+        except Exception:
+            log.debug(
+                "Could not extract spin metadata (ntypes_spin / use_spin) "
+                "from model.spin.",
+                exc_info=True,
+            )
+    model_output_types: list[str] = []
+    try:
+        out_def = model.model_output_def()
+        for kk, vv in out_def.var_defs.items():
+            if int(vv.category) == 0:
+                model_output_types.append(kk)
+    except Exception:
+        log.debug(
+            "Could not compute model_output_types from model_output_def(); "
+            "using empty list.",
+            exc_info=True,
+        )
+    model_def_json = json.dumps(params, default=str)
+
+    # --- Validate edge-schema sync (gated by env var) ---
+    # is_spin is always False at this point (spin models are rejected above);
+    # the condition is kept explicit for clarity and future-proofing.
+    if not is_spin:
+        try:
+            formatted_nlist_sync = model.format_nlist(ext_coord, ext_atype, nlist_t)
+            _validate_edge_schema_sync(
+                ext_coord,
+                ext_atype[:, :_PTH_SAMPLE_NLOC],
+                formatted_nlist_sync,
+                mapping_t,
+            )
+        except Exception:
+            log.debug(
+                "Edge-schema sync check skipped (could not build reference "
+                "formatted nlist).",
+                exc_info=True,
+            )
+
+    # --- Trace / script the wrapper ---
+    log.info("Converting FX graph to TorchScript (torch.jit.trace)...")
+    wrapper = SeZMPTHModel(
+        traced,
+        sel=sel,
+        rcut=rcut,
+        ntypes=ntypes,
+        type_map=type_map,
+        nnei=nnei,
+        nsel=nsel_val,
+        dim_fparam=dim_fparam,
+        dim_aparam=dim_aparam,
+        dim_chg_spin=dim_chg_spin,
+        has_mp=has_mp,
+        min_nbor_dist=min_nbor_dist_val,
+        model_def_json=model_def_json,
+        model_output_types=model_output_types,
+        has_default_fparam=has_default_fparam_val,
+        default_fparam=default_fparam_val,
+        default_chg_spin=default_chg_spin_val,
+        mixed_types=mixed_types_val,
+        is_spin=is_spin,
+        ntypes_spin=ntypes_spin_val,
+        use_spin=use_spin_val,
+        lower_input_kind=_lower_input_kind,
+        lower_nf=1,
+        do_grad_r=do_grad_r,
+        do_grad_c=do_grad_c,
+    )
+    wrapper.eval()
+
+    # Build concrete LAMMPS-level inputs for tracing forward_lower.
+    lammps_ext_coord = ext_coord  # (1, nall, 3)
+    lammps_ext_atype = ext_atype  # (1, nall)
+    lammps_nlist = nlist_t  # (1, nloc, nsel)
+    lammps_mapping = mapping_t  # (1, nall)
+    lammps_fparam = (
+        torch.zeros(1, dim_fparam, dtype=torch.float64) if dim_fparam > 0 else None
+    )
+    lammps_aparam = (
+        torch.zeros(1, _PTH_SAMPLE_NLOC, dim_aparam, dtype=torch.float64)
+        if dim_aparam > 0
+        else None
+    )
+    lammps_chg_spin = (
+        torch.zeros(1, dim_chg_spin, dtype=torch.float64) if dim_chg_spin > 0 else None
+    )
+
+    try:
+        traced_module = torch.jit.trace_module(
+            wrapper,
+            {
+                "forward_lower": (
+                    lammps_ext_coord,
+                    lammps_ext_atype,
+                    lammps_nlist,
+                    lammps_mapping,
+                    lammps_fparam,
+                    lammps_aparam,
+                    atomic_virial,
+                    None,  # comm_dict
+                    lammps_chg_spin,
+                ),
+            },
+        )
+        log.info("TorchScript tracing succeeded.")
+    except Exception as e:
+        log.warning(
+            "torch.jit.trace failed: %s. Falling back to torch.jit.script. "
+            "The frozen model may have untraced control-flow branches; "
+            "verify with `dp --pt test` before deploying to LAMMPS.",
+            e,
+        )
+        try:
+            traced_module = torch.jit.script(wrapper)
+            log.info("TorchScript scripting succeeded.")
+            # Validate that the scripted model produces the same output as
+            # the original wrapper on the trace sample inputs.
+            with torch.no_grad():
+                ref_out = wrapper.forward_lower(
+                    lammps_ext_coord,
+                    lammps_ext_atype,
+                    lammps_nlist,
+                    lammps_mapping,
+                    lammps_fparam,
+                    lammps_aparam,
+                    atomic_virial,
+                    None,
+                    lammps_chg_spin,
+                )
+                ts_out = traced_module.forward_lower(
+                    lammps_ext_coord,
+                    lammps_ext_atype,
+                    lammps_nlist,
+                    lammps_mapping,
+                    lammps_fparam,
+                    lammps_aparam,
+                    atomic_virial,
+                    None,
+                    lammps_chg_spin,
+                )
+            mismatches = []
+            for key in ref_out:
+                if key not in ts_out:
+                    mismatches.append(f"  {key}: missing in scripted output")
+                    continue
+                ref_val = ref_out[key]
+                ts_val = ts_out[key]
+                if ref_val.shape != ts_val.shape:
+                    mismatches.append(
+                        f"  {key}: shape mismatch "
+                        f"ref={tuple(ref_val.shape)} "
+                        f"scripted={tuple(ts_val.shape)}"
+                    )
+                    continue
+                max_diff = float((ref_val.float() - ts_val.float()).abs().max())
+                if max_diff > 1e-5:
+                    mismatches.append(f"  {key}: max abs diff={max_diff:.2e}")
+            if mismatches:
+                log.error(
+                    "TorchScript fallback output validation FAILED:\n%s\n"
+                    "The scripted model produces different results than the "
+                    "original. The .pth model may be incorrect -- do not "
+                    "deploy to LAMMPS without verifying with `dp --pt test`.",
+                    "\n".join(mismatches),
+                )
+            else:
+                log.info(
+                    "TorchScript fallback output validation passed "
+                    "(all %d keys match within 1e-5).",
+                    len(ref_out),
+                )
+        except Exception as e2:
+            raise RuntimeError(
+                f"Failed to convert SeZM model to TorchScript: {e2}. "
+                f"The model may use operations not supported by TorchScript. "
+                f"Try using freeze_sezm_to_pt2() for AOTInductor export instead."
+            ) from e2
+
+    # --- Move to target device ---
+    if target_device.type != "cpu":
+        traced_module.to(target_device)
+
+    # --- Save ---
+    out_path_str = str(out_path)
+    torch.jit.save(traced_module, out_path_str)
     log.info(
-        "Thank you for using the DPA4/SeZM model! If it benefits your "
-        "research, please cite the DPA4 paper "
-        "(https://arxiv.org/abs/2606.02419):"
+        "Saved SeZM .pth to %s (device=%s, output_keys=%s)",
+        out_path_str,
+        target_device,
+        output_keys,
     )
     log.info(
-        "\n"
-        "@article{li2026dpa4,\n"
-        "  title = {{DPA4}: Pushing the Accuracy-Cost Frontier of Interatomic "
-        "Potentials with {EMFA} {SO(2)} Convolution},\n"
-        "  author = {Li, Tiancheng and Li, Wentao and Peng, Anyang and "
-        "Xue, Jianming and Zhang, Linfeng and Zhang, Duo and Wang, Han},\n"
-        "  journal = {arXiv preprint arXiv:2606.02419},\n"
-        "  year = {2026},\n"
-        "  eprint = {2606.02419},\n"
-        "  archivePrefix = {arXiv},\n"
-        "  primaryClass = {physics.chem-ph},\n"
-        "  doi = {10.48550/arXiv.2606.02419},\n"
-        "  url = {https://arxiv.org/abs/2606.02419}\n"
-        "}"
+        "The .pth model can be loaded by LAMMPS via DeepPotPT on any CUDA GPU "
+        "(Pascal P100 / sm_60+ supported, no Triton required)."
     )
+    _log_dpa4_citation()
 
 
 __all__ = [
     "freeze_sezm_to_pt2",
+    "freeze_sezm_to_pth",
     "is_sezm_checkpoint",
 ]

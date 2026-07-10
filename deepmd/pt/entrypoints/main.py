@@ -484,15 +484,34 @@ def freeze(
     model: str,
     output: str = "frozen_model.pth",
     head: str | None = None,
+    legacy_gpu: bool = False,
 ) -> None:
     # DPA4 / SeZM checkpoints are routed to the AOTInductor .pt2 exporter
+    # by default; the --legacy-gpu flag routes them to TorchScript .pth instead.
     from deepmd.pt.entrypoints.freeze_pt2 import (
         freeze_sezm_to_pt2,
+        freeze_sezm_to_pth,
         is_sezm_checkpoint,
     )
 
     output_path = Path(output)
     if is_sezm_checkpoint(model):
+        if legacy_gpu:
+            out_pth = str(output_path.with_suffix(".pth"))
+            if output_path.suffix.lower() != ".pth":
+                log.info(
+                    "Output extension changed from '%s' to '.pth' "
+                    "(legacy-GPU mode always produces .pth files).",
+                    output_path.suffix,
+                )
+            freeze_sezm_to_pth(model, out_pth, head=head)
+            log.info(
+                "Detected DPA4 / SeZM checkpoint '%s'; saved TorchScript .pth "
+                "archive to %s (legacy-GPU mode)",
+                model,
+                out_pth,
+            )
+            return
         out_pt2 = str(output_path.with_suffix(".pt2"))
         freeze_sezm_to_pt2(model, out_pt2, head=head)
         log.info(
@@ -696,9 +715,15 @@ def main(args: list[str] | argparse.Namespace | None = None) -> None:
         else:
             FLAGS.model = FLAGS.checkpoint_folder
         # Output suffix is decided inside freeze(): SeZM checkpoints
-        # produce ``.pt2`` (AOTInductor), every other backend produces
-        # the legacy ``.pth`` (TorchScript).
-        freeze(model=FLAGS.model, output=FLAGS.output, head=FLAGS.head)
+        # produce ``.pt2`` (AOTInductor) by default, or ``.pth``
+        # (TorchScript) when --legacy-gpu is set. Every other backend
+        # produces the legacy ``.pth`` (TorchScript).
+        freeze(
+            model=FLAGS.model,
+            output=FLAGS.output,
+            head=FLAGS.head,
+            legacy_gpu=FLAGS.legacy_gpu,
+        )
     elif FLAGS.command == "change-bias":
         change_bias(
             input_file=FLAGS.INPUT,
