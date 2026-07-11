@@ -761,14 +761,6 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 f"DP_TF32_INFER must be one of 0/1/2, got {tf32_infer_env!r}"
             )
         self._tf32_infer_precision = _TF32_INFER_PRECISION_CHOICES[tf32_infer_env]
-        # Fail fast at construction for *both* the inference compile flag
-        # (DP_COMPILE_INFER) and the training compile flag (use_compile): the
-        # torch.compile path lowers through Triton, unsupported on Pascal.
-        # env.DEVICE is the best device available before parameters are placed;
-        # should_use_compile re-checks against the model's real runtime device.
-        if self._env_use_compile_infer is True or self.use_compile:
-            check_compile_torch_version()
-            assert_triton_supported_gpu(env.DEVICE)
 
         # === Bridging (optional short-range zone bridging) ===
         self.bridging_method: str = str(bridging_method).upper()
@@ -779,6 +771,50 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             if self.bridging_method != "NONE"
             else None
         )
+
+    def validate_compile_device(
+        self,
+        device: torch.device | int | str | None = None,
+    ) -> None:
+        """Validate that the current device can run the compile / Triton path.
+
+        The SeZM/DPA4 ``torch.compile`` and AOTInductor paths lower through
+        Triton, which requires Volta (sm_70) or newer GPUs.  Pascal (sm_60)
+        and older are unsupported.
+
+        Callers that intend to use ``torch.compile``, AOTInductor, or any
+        Triton-lowered path **MUST** call this method after construction and
+        before the first forward pass.  Callers that use the dense eager path
+        or TorchScript export (``--legacy-gpu``) **MUST NOT** call it.
+
+        .. note::
+
+           The AOTInductor freeze entry point (:func:`freeze_sezm_to_pt2
+           <deepmd.pt.entrypoints.freeze_pt2.freeze_sezm_to_pt2>`) performs
+           its own equivalent Pascal compute-capability check with additional
+           escape hatches (``DP_FREEZE_FORCE_AOTI``) and therefore does
+           **not** call this method.  This method is intended for training
+           entry points, inference scripts, and other callers that construct a
+           :class:`SeZMModel` directly.
+
+        Parameters
+        ----------
+        device
+            Device to check; ``None`` resolves to the model's parameter
+            device, falling back to :data:`env.DEVICE`.
+
+        Raises
+        ------
+        RuntimeError
+            If compile is requested but the current device is a Pascal GPU
+            (compute capability sm_60) or the PyTorch version is too old.
+        """
+        if self._env_use_compile_infer is True or self.use_compile:
+            check_compile_torch_version()
+            if device is None:
+                param = next(self.parameters(), None)
+                device = param.device if param is not None else env.DEVICE
+            assert_triton_supported_gpu(device)
 
     # =========================================================================
     # Forward Methods

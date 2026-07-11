@@ -2562,6 +2562,15 @@ def get_single_model(
         model = get_zbl_model(deepcopy(_model_params)).to(DEVICE)
     else:
         model = get_model(deepcopy(_model_params)).to(DEVICE)
+    # Early fail-fast for SeZM/DPA4 models: validate that the target
+    # device supports Triton before entering the training loop (which may
+    # involve expensive data loading).  The validate_compile_device
+    # method is a no-op when compile is not requested, so it is safe to
+    # call unconditionally.  The TorchScript export path
+    # (freeze_sezm_to_pth / --legacy-gpu) does NOT go through this
+    # codepath, so it is unaffected.
+    if isinstance(model, SeZMModel):
+        model.validate_compile_device()
     return model
 
 

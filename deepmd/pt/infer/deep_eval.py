@@ -206,6 +206,11 @@ class DeepEval(DeepEvalBackend):
                         ] = state_dict[item].clone()
                 state_dict = state_dict_head
             model = get_model(self.input_param).to(DEVICE)
+            # Early fail-fast for SeZM/DPA4 models: validate that the
+            # target device supports Triton before entering the inference
+            # loop.  This is a no-op when compile is not requested.
+            if hasattr(model, "validate_compile_device"):
+                model.validate_compile_device()
             disable_jit = no_jit or _is_sezm_model_params(self.input_param)
             if not self.input_param.get("hessian_mode") and not disable_jit:
                 model = torch.jit.script(model)
