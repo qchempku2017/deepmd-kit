@@ -1253,18 +1253,43 @@ def freeze_sezm_to_pt2(
     _log_dpa4_citation()
 
 
-class SeZMPTHModel(torch.nn.Module):
-    """TorchScript-compatible wrapper for a SeZM frozen .pth model.
+def _format_nlist_to_nnei(nlist: torch.Tensor, nnei_target: int) -> torch.Tensor:
+    """Pad or truncate a LAMMPS neighbour list to exactly ``nnei`` columns.
 
-    Exposes ``forward_lower`` with the standard LAMMPS contract so
-    ``DeepPotPT`` can load and call it.  The edge-level compute graph
-    (from ``make_fx``) is stored as a sub-module and invoked after
-    converting the LAMMPS neighbour list to the edge schema.
+    Shared by the ``forward_lower`` methods of both ``SeZMPTHModel`` and
+    ``SeZMSpinPTHModel`` to ensure the traced lower graph receives a
+    consistent nnei dimension regardless of the actual LAMMPS neighbour
+    count.
+    """
+    nf, nloc_val, nsel_in = nlist.shape
+    if nsel_in < nnei_target:
+        pad = torch.full(
+            (nf, nloc_val, nnei_target - nsel_in),
+            -1,
+            dtype=nlist.dtype,
+            device=nlist.device,
+        )
+        fnlist = torch.cat([nlist, pad], dim=2)
+    elif nsel_in > nnei_target:
+        # Keep nearest nnei_target neighbours (first nnei_target columns).
+        fnlist = nlist[:, :, :nnei_target]
+    else:
+        fnlist = nlist
+    return fnlist.contiguous()
+
+
+class _BaseSeZMPTHModel(torch.nn.Module):
+    """Shared base for TorchScript-compatible SeZM frozen .pth model wrappers.
+
+    Stores the traced lower graph and all LAMMPS-facing metadata, and
+    exposes the public accessor methods expected by ``DeepPotPT`` /
+    ``DeepSpinPT``.  Concrete subclasses provide the appropriate
+    ``forward_lower`` contract for their respective LAMMPS interface.
 
     Parameters
     ----------
     lower_graph
-        The ``make_fx``-traced lower graph (edge-level).
+        The ``make_fx``-traced lower graph.
     metadata
         All model metadata values needed by the public API and
         ``forward_lower`` post-processing.
@@ -1414,6 +1439,16 @@ class SeZMPTHModel(torch.nn.Module):
     def get_use_spin(self) -> list[bool]:
         return self._use_spin
 
+
+class SeZMPTHModel(_BaseSeZMPTHModel):
+    """TorchScript-compatible wrapper for a non-spin SeZM frozen .pth model.
+
+    Exposes ``forward_lower`` with the standard ``DeepPotPT`` LAMMPS
+    contract.  The edge-level compute graph (from ``make_fx``) is stored
+    on the parent class and invoked after converting the LAMMPS neighbour
+    list to the edge schema.
+    """
+
     @torch.jit.export
     def forward_lower(
         self,
@@ -1427,7 +1462,7 @@ class SeZMPTHModel(torch.nn.Module):
         comm_dict: dict[str, torch.Tensor] | None = None,
         charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Standard LAMMPS ``forward_lower`` contract.
+        """Standard LAMMPS ``forward_lower`` contract (``DeepPotPT``).
 
         Converts the LAMMPS neighbour list to the edge schema, runs the
         traced lower graph, and post-processes the output into the format
@@ -1435,29 +1470,14 @@ class SeZMPTHModel(torch.nn.Module):
 
         .. note::
            Only the energy (non-spin) edge ABI is supported by this wrapper.
-           ``DeepPotPT.forward_lower`` does not supply ``extended_spin``,
-           so spin models (native-spin and virtual-spin) are rejected during
-           freezing via ``freeze_sezm_to_pth`` and cannot reach this method.
+           ``DeepPotPT.forward_lower`` does not supply ``extended_spin``.
+           Spin models are routed to ``SeZMSpinPTHModel`` instead, which
+           implements the ``DeepSpinPT`` contract.
         """
-        # --- Step 1: simplified format_nlist (mixed_types=True) ---
-        nf, nloc_val, nsel_in = nlist.shape
+        # --- Step 1: format nlist (pad/truncate to nnei) ---
         nnei_target = self._nnei
-        # Pad or truncate nlist to match nnei.
-        if nsel_in < nnei_target:
-            pad = torch.full(
-                (nf, nloc_val, nnei_target - nsel_in),
-                -1,
-                dtype=nlist.dtype,
-                device=nlist.device,
-            )
-            fnlist = torch.cat([nlist, pad], dim=2)
-        elif nsel_in > nnei_target:
-            # Keep nearest nnei_target neighbours (first nnei_target columns).
-            fnlist = nlist[:, :, :nnei_target].contiguous()
-        else:
-            fnlist = nlist
-        # Ensure fnlist is contiguous.
-        fnlist = fnlist.contiguous()
+        fnlist = _format_nlist_to_nnei(nlist, nnei_target)
+        nf, nloc_val, _ = fnlist.shape
 
         # --- Step 2: build edge schema via shared helper ---
         (
@@ -1505,6 +1525,77 @@ class SeZMPTHModel(torch.nn.Module):
         return model_predict
 
 
+class SeZMSpinPTHModel(_BaseSeZMPTHModel):
+    """TorchScript-compatible wrapper for a spin SeZM frozen .pth model.
+
+    Exposes ``forward_lower`` with the ``DeepSpinPT`` LAMMPS contract
+    (``extended_spin`` between ``extended_atype`` and ``nlist``) so
+    LAMMPS can load and call it via ``pair_style deepmd/spin``.
+
+    Supports the ``nlist`` lower ABI (virtual-spin / deepspin scheme)
+    where the traced lower graph places virtual atoms internally from
+    the extended inputs and raw neighbour list.  The ``edge_vec`` ABI
+    (native spin) is not yet supported by this wrapper.
+    """
+
+    @torch.jit.export
+    def forward_lower(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        extended_spin: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor | None = None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        do_atomic_virial: bool = False,
+        comm_dict: dict[str, torch.Tensor] | None = None,
+        charge_spin: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """``DeepSpinPT`` LAMMPS ``forward_lower`` contract.
+
+        The traced lower graph (``nlist`` ABI) places virtual atoms
+        internally, so this wrapper formats the LAMMPS neighbour list
+        and passes the raw extended inputs straight through.
+
+        .. note::
+           ``DeepSpinPT`` does **not** pass ``charge_spin``; the
+           parameter is accepted for signature compatibility but is
+           always ``None`` at runtime.
+        """
+        # --- Step 1: format nlist (pad/truncate to nnei) ---
+        fnlist = _format_nlist_to_nnei(nlist, self._nnei)
+
+        # --- Step 2: call the traced lower graph (nlist ABI) ---
+        lower_inputs = (
+            extended_coord,
+            extended_atype.to(dtype=torch.long),
+            extended_spin,
+            fnlist,
+            mapping,
+            fparam,
+            aparam,
+            charge_spin,
+        )
+        result = self.lower_graph(*lower_inputs)
+
+        # --- Step 3: post-process output ---
+        model_predict: dict[str, torch.Tensor] = {}
+        model_predict["atom_energy"] = result["energy"]
+        model_predict["energy"] = result["energy_redu"]
+        model_predict["extended_mask_mag"] = result["mask_mag"]
+        if self._do_grad_r:
+            model_predict["extended_force"] = result["energy_derv_r"].squeeze(-2)
+            model_predict["extended_force_mag"] = result["energy_derv_r_mag"].squeeze(
+                -2
+            )
+        if self._do_grad_c:
+            model_predict["virial"] = result["energy_derv_c_redu"].squeeze(-2)
+            if do_atomic_virial:
+                model_predict["extended_virial"] = result["energy_derv_c"].squeeze(-2)
+        return model_predict
+
+
 def freeze_sezm_to_pth(
     ckpt_path: str,
     out_path: str,
@@ -1520,15 +1611,15 @@ def freeze_sezm_to_pth(
     including Pascal / P100 (sm_60).  No Triton or AOTInductor dependency is
     required, making this the freeze path for legacy-GPU LAMMPS deployments.
 
-    Supports plain energy SeZM/DPA4 models only.  The exported ``.pth`` is
-    loaded by ``DeepPotPT`` (the standard PyTorch LAMMPS interface) and exposes
-    the same ``forward_lower`` contract as other ``.pth`` energy models.
+    Supports both plain energy and spin (virtual-spin / ``nlist`` ABI)
+    SeZM/DPA4 models.  Energy models are exported via ``SeZMPTHModel``
+    (loaded by ``DeepPotPT`` in LAMMPS); spin models are exported via
+    ``SeZMSpinPTHModel`` (loaded by ``DeepSpinPT`` in LAMMPS).
 
     .. note::
-       Spin (native-spin and virtual-spin) models are **not** supported by
-       this path because ``DeepPotPT.forward_lower`` does not supply an
-       ``extended_spin`` tensor.  Use ``freeze_sezm_to_pt2`` (``dp --pt
-       freeze`` without ``--legacy-gpu``) for spin models.
+       Only the ``nlist`` lower ABI (virtual-spin scheme, used by SeZM
+       spin models) is supported for spin.  The ``edge_vec`` ABI (native
+       spin) is not yet supported by this path.
 
     Parameters
     ----------
@@ -1582,22 +1673,18 @@ def freeze_sezm_to_pth(
     _state_dict, params, model = _load_sezm_checkpoint(ckpt_path, head)
     is_spin = _model_has_spin(model)
 
-    # SeZMPTHModel implements the DeepPotPT.forward_lower contract, which
-    # does not supply an extended_spin tensor.  Spin models must be frozen
-    # via the .pt2 (AOTInductor) path or loaded through DeepSpinPT.
-    if is_spin:
+    # Determine the lower input kind.  Spin models (SeZM) use the "nlist"
+    # ABI where virtual atoms are placed inside the traced graph; non-spin
+    # models use the "edge_vec" ABI where the wrapper builds the edge
+    # schema from the LAMMPS neighbour list.
+    try:
+        _lower_input_kind = model.export_lower_input_kind()
+    except AttributeError:
         raise ValueError(
-            "Spin (native-spin or virtual-spin) SeZM models are not "
-            "supported by the .pth (TorchScript) freeze path.  "
-            "DeepPotPT.forward_lower does not supply an extended_spin "
-            "tensor, which spin models require.  Use the .pt2 freeze path "
-            "(dp --pt freeze without --legacy-gpu) for spin models instead."
+            "This SeZM checkpoint does not expose export_lower_input_kind(). "
+            "Please re-save the checkpoint with a newer version of deepmd-kit, "
+            "or use the .pt2 freeze path (dp --pt freeze) instead."
         )
-
-    # Only the energy (non-spin) edge ABI is supported by the .pth freeze
-    # path because DeepPotPT.forward_lower does not supply extended_spin.
-    # (Spin models are rejected above.)
-    _lower_input_kind = "edge"
 
     # --- Build sample inputs for the lower (edge-level) graph ---
     _, sample_inputs_cpu = _resolve_nframes(
@@ -1633,6 +1720,13 @@ def freeze_sezm_to_pth(
     dim_fparam = int(model.get_dim_fparam())
     dim_aparam = int(model.get_dim_aparam())
     dim_chg_spin = int(model.get_dim_chg_spin())
+    if is_spin and dim_chg_spin > 0:
+        raise ValueError(
+            "SeZM spin models do not support charge_spin. "
+            "dim_chg_spin must be 0 for the .pth freeze path. "
+            "Use the .pt2 freeze path (dp --pt freeze without --legacy-gpu) "
+            "for models with spin+charge."
+        )
     type_map = list(model.get_type_map())
     has_mp = _model_has_message_passing(model)
     nnei = int(sum(sel))
@@ -1659,7 +1753,7 @@ def freeze_sezm_to_pth(
         try:
             ntypes_spin_val = int(model.spin.get_ntypes_spin())
             use_spin_val = [bool(v) for v in model.spin.use_spin]
-        except Exception:
+        except (AttributeError, NotImplementedError):
             log.debug(
                 "Could not extract spin metadata (ntypes_spin / use_spin) "
                 "from model.spin.",
@@ -1680,8 +1774,9 @@ def freeze_sezm_to_pth(
     model_def_json = json.dumps(params, default=str)
 
     # --- Validate edge-schema sync (gated by env var) ---
-    # is_spin is always False at this point (spin models are rejected above);
-    # the condition is kept explicit for clarity and future-proofing.
+    # Only applicable to non-spin models (edge_vec ABI) where the wrapper
+    # builds the edge schema from the LAMMPS nlist.  Spin models use the
+    # nlist ABI and pass raw inputs straight through.
     if not is_spin:
         try:
             formatted_nlist_sync = model.format_nlist(ext_coord, ext_atype, nlist_t)
@@ -1699,37 +1794,36 @@ def freeze_sezm_to_pth(
             )
 
     # --- Trace / script the wrapper ---
-    log.info("Converting FX graph to TorchScript (torch.jit.trace)...")
-    wrapper = SeZMPTHModel(
-        traced,
-        sel=sel,
-        rcut=rcut,
-        ntypes=ntypes,
-        type_map=type_map,
-        nnei=nnei,
-        nsel=nsel_val,
-        dim_fparam=dim_fparam,
-        dim_aparam=dim_aparam,
-        dim_chg_spin=dim_chg_spin,
-        has_mp=has_mp,
-        min_nbor_dist=min_nbor_dist_val,
-        model_def_json=model_def_json,
-        model_output_types=model_output_types,
-        has_default_fparam=has_default_fparam_val,
-        default_fparam=default_fparam_val,
-        default_chg_spin=default_chg_spin_val,
-        mixed_types=mixed_types_val,
-        is_spin=is_spin,
-        ntypes_spin=ntypes_spin_val,
-        use_spin=use_spin_val,
-        lower_input_kind=_lower_input_kind,
-        lower_nf=1,
-        do_grad_r=do_grad_r,
-        do_grad_c=do_grad_c,
-    )
-    wrapper.eval()
+    # Build the appropriate wrapper and LAMMPS-level trace inputs.
+    # Spin models → SeZMSpinPTHModel (DeepSpinPT contract: extended_spin
+    # between atype and nlist).  Non-spin → SeZMPTHModel (DeepPotPT contract).
+    common_kwargs = {
+        "sel": sel,
+        "rcut": rcut,
+        "ntypes": ntypes,
+        "type_map": type_map,
+        "nnei": nnei,
+        "nsel": nsel_val,
+        "dim_fparam": dim_fparam,
+        "dim_aparam": dim_aparam,
+        "dim_chg_spin": dim_chg_spin,
+        "has_mp": has_mp,
+        "min_nbor_dist": min_nbor_dist_val,
+        "model_def_json": model_def_json,
+        "model_output_types": model_output_types,
+        "has_default_fparam": has_default_fparam_val,
+        "default_fparam": default_fparam_val,
+        "default_chg_spin": default_chg_spin_val,
+        "mixed_types": mixed_types_val,
+        "is_spin": is_spin,
+        "ntypes_spin": ntypes_spin_val,
+        "use_spin": use_spin_val,
+        "lower_input_kind": _lower_input_kind,
+        "lower_nf": 1,
+        "do_grad_r": do_grad_r,
+        "do_grad_c": do_grad_c,
+    }
 
-    # Build concrete LAMMPS-level inputs for tracing forward_lower.
     lammps_ext_coord = ext_coord  # (1, nall, 3)
     lammps_ext_atype = ext_atype  # (1, nall)
     lammps_nlist = nlist_t  # (1, nloc, nsel)
@@ -1746,22 +1840,45 @@ def freeze_sezm_to_pth(
         torch.zeros(1, dim_chg_spin, dtype=torch.float64) if dim_chg_spin > 0 else None
     )
 
+    if is_spin:
+        log.info("Converting spin FX graph to TorchScript (torch.jit.trace)...")
+        wrapper = SeZMSpinPTHModel(traced, **common_kwargs)
+        wrapper.eval()
+        # DeepSpinPT passes: coord, atype, spin, nlist, mapping,
+        # fparam, aparam, do_atomic_virial[, comm_dict].
+        # ext_tensors = (coord, atype, nlist, mapping, spin, fparam, aparam, chg_spin)
+        _, _, _, _, lammps_ext_spin, _, _, _ = ext_tensors  # (1, nall, 3)
+        trace_inputs = (
+            lammps_ext_coord,
+            lammps_ext_atype,
+            lammps_ext_spin,
+            lammps_nlist,
+            lammps_mapping,
+            lammps_fparam,
+            lammps_aparam,
+            atomic_virial,
+            None,  # comm_dict
+        )
+    else:
+        log.info("Converting FX graph to TorchScript (torch.jit.trace)...")
+        wrapper = SeZMPTHModel(traced, **common_kwargs)
+        wrapper.eval()
+        trace_inputs = (
+            lammps_ext_coord,
+            lammps_ext_atype,
+            lammps_nlist,
+            lammps_mapping,
+            lammps_fparam,
+            lammps_aparam,
+            atomic_virial,
+            None,  # comm_dict
+            lammps_chg_spin,
+        )
+
     try:
         traced_module = torch.jit.trace_module(
             wrapper,
-            {
-                "forward_lower": (
-                    lammps_ext_coord,
-                    lammps_ext_atype,
-                    lammps_nlist,
-                    lammps_mapping,
-                    lammps_fparam,
-                    lammps_aparam,
-                    atomic_virial,
-                    None,  # comm_dict
-                    lammps_chg_spin,
-                ),
-            },
+            {"forward_lower": trace_inputs},
         )
         log.info("TorchScript tracing succeeded.")
     except Exception as e:
@@ -1777,28 +1894,8 @@ def freeze_sezm_to_pth(
             # Validate that the scripted model produces the same output as
             # the original wrapper on the trace sample inputs.
             with torch.no_grad():
-                ref_out = wrapper.forward_lower(
-                    lammps_ext_coord,
-                    lammps_ext_atype,
-                    lammps_nlist,
-                    lammps_mapping,
-                    lammps_fparam,
-                    lammps_aparam,
-                    atomic_virial,
-                    None,
-                    lammps_chg_spin,
-                )
-                ts_out = traced_module.forward_lower(
-                    lammps_ext_coord,
-                    lammps_ext_atype,
-                    lammps_nlist,
-                    lammps_mapping,
-                    lammps_fparam,
-                    lammps_aparam,
-                    atomic_virial,
-                    None,
-                    lammps_chg_spin,
-                )
+                ref_out = wrapper.forward_lower(*trace_inputs)
+                ts_out = traced_module.forward_lower(*trace_inputs)
             mismatches = []
             for key in ref_out:
                 if key not in ts_out:
@@ -1850,15 +1947,23 @@ def freeze_sezm_to_pth(
         target_device,
         output_keys,
     )
+    loader_name = "DeepSpinPT" if is_spin else "DeepPotPT"
     log.info(
-        "The .pth model can be loaded by LAMMPS via DeepPotPT on any CUDA GPU "
-        "(Pascal P100 / sm_60+ supported, no Triton required)."
+        "The .pth model can be loaded by LAMMPS via %s on any CUDA GPU "
+        "(Pascal P100 / sm_60+ supported, no Triton required).",
+        loader_name,
     )
     _log_dpa4_citation()
 
 
 __all__ = [
+    "SeZMPTHModel",
+    "SeZMSpinPTHModel",
     "freeze_sezm_to_pt2",
     "freeze_sezm_to_pth",
     "is_sezm_checkpoint",
 ]
+
+]
+
+
