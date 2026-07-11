@@ -798,6 +798,10 @@ def _make_edge_comm_tensors(
     send_count = max(1, nghost)
     owner = mapping[0, nloc:nall].to(dtype=torch.int32).cpu().numpy()
     indices = np.ascontiguousarray(np.resize(owner, send_count).astype(np.int32))
+    # Clear stale keepalive arrays from a previous freeze before appending
+    # the current trace's sendlist; the old arrays' embedded pointer
+    # addresses are no longer valid once the earlier trace + export returns.
+    _TRACE_SENDLIST_KEEPALIVE.clear()
     _TRACE_SENDLIST_KEEPALIVE.append(indices)
     addr = indices.ctypes.data_as(ctypes.c_void_p).value
     return (
@@ -2006,3 +2010,4 @@ __all__ = [
     "freeze_sezm_to_pth",
     "is_sezm_checkpoint",
 ]
+
