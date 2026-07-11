@@ -1315,12 +1315,19 @@ class _LowerGraphWrapper(torch.nn.Module):
     ``self._fx(*args)`` inline, so the FX graph is inlined into
     the traced TorchScript IR without ever exposing the FX type name to the
     type resolver.
+
+    ``forward`` carries ``@torch.jit.ignore`` so that the FX graph is
+    treated as an opaque eager-mode call instead of being inlined into the
+    TorchScript IR.  This avoids JIT-compilation issues with FX-generated
+    operators on legacy GPU hardware where certain TorchScript-compiled
+    kernels may be unsupported or produce incorrect results.
     """
 
     def __init__(self, fx_module: torch.nn.Module) -> None:
         super().__init__()
         self._fx = fx_module
 
+    @torch.jit.ignore
     def forward(self, *args: Any) -> Any:
         return self._fx(*args)
 
