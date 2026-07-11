@@ -161,7 +161,7 @@ def _build_edge_schema_ts(
     extended_coord: torch.Tensor,
     nloc: int,
     nnei: int,
-) -> tuple[torch.Tensor, ...]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Build edge schema tensors from a LAMMPS-format neighbour list.
 
     This function is callable from within a TorchScript-traced
@@ -198,10 +198,30 @@ def _build_edge_schema_ts(
         1,
         dst_local.view(nf, nloc * nnei).unsqueeze(-1).expand(-1, -1, 3),
     ).reshape(-1, 3)
-    edge_vec = neighbor_coord - dst_coord
-    edge_index = torch.stack([neighbor_safe, dst_actual], dim=0)
-    edge_scatter_index = edge_index
-    edge_mask = valid_flat
+    edge_vec_all = neighbor_coord - dst_coord
+    edge_index_all = torch.stack([neighbor_safe, dst_actual], dim=0)
+    edge_scatter_all = edge_index_all
+    edge_mask_all = valid_flat
+    # Compact: keep only valid edges, mirroring edge_schema_from_extended.
+    valid_idx = torch.nonzero(valid_flat, as_tuple=False).flatten()
+    edge_index = edge_index_all[:, valid_idx]
+    edge_vec = edge_vec_all[valid_idx]
+    edge_scatter_index = edge_scatter_all[:, valid_idx]
+    # Append 2 dummy edges (matching _append_dummy_edges in edge_schema.py).
+    _DUMMY = 2
+    device = fnlist.device
+    dummy_index = torch.zeros((2, _DUMMY), dtype=edge_index.dtype, device=device)
+    dummy_vec = torch.zeros((_DUMMY, 3), dtype=edge_vec.dtype, device=device)
+    num_valid = valid_idx.shape[0]
+    edge_mask = torch.cat(
+        [
+            torch.ones(num_valid, dtype=torch.bool, device=device),
+            torch.zeros(_DUMMY, dtype=torch.bool, device=device),
+        ]
+    )
+    edge_index = torch.cat([edge_index, dummy_index], dim=1)
+    edge_vec = torch.cat([edge_vec, dummy_vec], dim=0)
+    edge_scatter_index = torch.cat([edge_scatter_index, dummy_index], dim=1)
     return (edge_index, edge_vec, edge_scatter_index, edge_mask, nf)
 
 
@@ -1278,6 +1298,29 @@ def _format_nlist_to_nnei(nlist: torch.Tensor, nnei_target: int) -> torch.Tensor
     return fnlist.contiguous()
 
 
+class _LowerGraphWrapper(torch.nn.Module):
+    """Thin wrapper that hides an FX GraphModule from TorchScript type checks.
+
+    TorchScript cannot resolve internal FX type names (e.g.
+    ``_dict_str_torch_Tensor_``) when the graph is stored directly as a
+    submodule of the top-level model being traced.  Wrapping it in a regular
+    ``nn.Module`` with a plain ``forward(*args, **kwargs)`` signature works
+    because ``torch.jit.trace`` only resolves the **direct** submodule's
+    class name for type-checking — it does not recurse into the type
+    hierarchy of nested submodules.  The tracer still records the call to
+    ``self._fx(*args, **kwargs)`` inline, so the FX graph is inlined into
+    the traced TorchScript IR without ever exposing the FX type name to the
+    type resolver.
+    """
+
+    def __init__(self, fx_module: torch.nn.Module) -> None:
+        super().__init__()
+        self._fx = fx_module
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        return self._fx(*args, **kwargs)
+
+
 class _BaseSeZMPTHModel(torch.nn.Module):
     """Shared base for TorchScript-compatible SeZM frozen .pth model wrappers.
 
@@ -1325,7 +1368,7 @@ class _BaseSeZMPTHModel(torch.nn.Module):
         do_grad_c: bool,
     ) -> None:
         super().__init__()
-        self.lower_graph = lower_graph
+        self.lower_graph = _LowerGraphWrapper(lower_graph)
         self._rcut = rcut
         self._ntypes = ntypes
         self._sel = sel
