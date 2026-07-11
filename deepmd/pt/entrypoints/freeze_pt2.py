@@ -1679,12 +1679,12 @@ def freeze_sezm_to_pth(
     # schema from the LAMMPS neighbour list.
     try:
         _lower_input_kind = model.export_lower_input_kind()
-    except AttributeError:
+    except AttributeError as err:
         raise ValueError(
             "This SeZM checkpoint does not expose export_lower_input_kind(). "
             "Please re-save the checkpoint with a newer version of deepmd-kit, "
             "or use the .pt2 freeze path (dp --pt freeze) instead."
-        )
+        ) from err
 
     # --- Build sample inputs for the lower (edge-level) graph ---
     _, sample_inputs_cpu = _resolve_nframes(
@@ -1962,8 +1962,6 @@ __all__ = [
     "freeze_sezm_to_pt2",
     "freeze_sezm_to_pth",
     "is_sezm_checkpoint",
-]
-
 ]
 
 
