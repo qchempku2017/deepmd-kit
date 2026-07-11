@@ -176,6 +176,16 @@ default training path. See `examples/water/dpa4/input_dens.json` for an example.
 
 ### Spin
 
+> **⚠️ Notice — Spin Model ``.pth`` Freeze Not Supported**
+>
+> Spin models can be **trained** with DPA4/SeZM, but **freezing to ``.pth``
+> (TorchScript) via ``dp --pt freeze --legacy-gpu`` is no longer supported**.
+> The ``SeZMSpinPTHModel`` wrapper class has been disabled.
+>
+> Spin model **``.pt2`` (AOTInductor) freezing** via ``dp --pt freeze``
+> (without ``--legacy-gpu``) **continues to work on Volta (`sm_70`) and
+> newer GPUs**, including LAMMPS deployment through ``DeepSpinPTExpt``.
+
 DPA4/SeZM supports the DeePMD-kit spin convention through the standard
 `model.spin` block. Two schemes are available, selected by `model.spin.scheme`:
 
@@ -520,7 +530,9 @@ Two settings improve multi-GPU runs:
   substantially increase memory use.
 
 Multi-GPU inference applies to the plain energy model. ZBL zone bridging and
-spin models run on a single MPI rank.
+spin models run on a single MPI rank. Spin model **``.pth`` (TorchScript)
+freezing** via ``--legacy-gpu`` is not supported; ``.pt2`` (AOTInductor)
+freezing works on Volta+ GPUs. See the [Spin](#spin) section above.
 
 ## Embedding extraction
 
@@ -640,6 +652,11 @@ closed over the one-hop neighbor shell.
 - Model compression is not supported.
 - Multi-GPU (MPI) LAMMPS inference is supported for the plain energy model;
   ZBL zone bridging and spin models run on a single MPI rank.
+- **Spin model `.pth` freezing is not supported**: spin models (native or
+  deepspin scheme) cannot be frozen to `.pth` via ``dp --pt freeze
+  --legacy-gpu``; the ``SeZMSpinPTHModel`` wrapper has been disabled. Spin
+  model **`.pt2` (AOTInductor) freezing** via ``dp --pt freeze`` (without
+  ``--legacy-gpu``) works on Volta+ GPUs.
 
 ## Citation
 

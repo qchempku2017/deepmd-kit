@@ -1779,20 +1779,31 @@ class SeZMPTHModel(_BaseSeZMPTHModel):
         )
 
         # --- Step 3: call the traced lower graph ---
+        # This wrapper is paired with LowerGraphNoParamAdapter, whose scripted
+        # schema contains exactly six Tensor inputs. Reject unsupported optional
+        # parameters before crossing the TorchScript module boundary.
+        if fparam is not None:
+            raise RuntimeError(
+                "This frozen SeZM model has dim_fparam=0, but fparam was supplied."
+            )
+        if aparam is not None:
+            raise RuntimeError(
+                "This frozen SeZM model has dim_aparam=0, but aparam was supplied."
+            )
+        if charge_spin is not None:
+            raise RuntimeError(
+                "This frozen SeZM model has dim_chg_spin=0, but charge_spin was supplied."
+            )
+
         atype_local = extended_atype[:, :nloc_val].to(dtype=torch.long)
-        lower_inputs = (
+        result = self.lower_graph(
             dst_coord,
             atype_local,
             edge_index.to(dtype=torch.long),
             edge_vec,
             edge_scatter_index.to(dtype=torch.long),
             edge_mask,
-            fparam,
-            aparam,
-            charge_spin,
         )
-
-        result = self.lower_graph(*lower_inputs)
 
         # --- Step 4: post-process output ---
         model_predict: dict[str, torch.Tensor] = {}
@@ -1818,6 +1829,14 @@ class SeZMSpinPTHModel(_BaseSeZMPTHModel):
     where the traced lower graph places virtual atoms internally from
     the extended inputs and raw neighbour list.  The ``edge_vec`` ABI
     (native spin) is not yet supported by this wrapper.
+
+    .. note::
+       This class is currently **disabled** and not instantiated by
+       ``freeze_sezm_to_pth``, which raises ``NotImplementedError`` for
+       spin models. It is retained in the codebase as a reference for
+       potential future re-enablement of spin ``.pth`` freeze support.
+       Spin model ``.pt2`` (AOTInductor) freezing via
+       ``freeze_sezm_to_pt2`` continues to work on Volta+ GPUs.
     """
 
     @torch.jit.export
@@ -1889,19 +1908,12 @@ def freeze_sezm_to_pth(
     """Freeze a SeZM checkpoint into a TorchScript ``.pth`` file.
 
     This path converts the eager lower graph (traced via ``make_fx``) into a
-    TorchScript module that works on **all** CUDA GPUs supported by PyTorch,
-    including Pascal / P100 (sm_60).  No Triton or AOTInductor dependency is
-    required, making this the freeze path for legacy-GPU LAMMPS deployments.
+    self-contained TorchScript module without Triton or AOTInductor.
 
-    Supports both plain energy and spin (virtual-spin / ``nlist`` ABI)
-    SeZM/DPA4 models.  Energy models are exported via ``SeZMPTHModel``
-    (loaded by ``DeepPotPT`` in LAMMPS); spin models are exported via
-    ``SeZMSpinPTHModel`` (loaded by ``DeepSpinPT`` in LAMMPS).
-
-    .. note::
-       Only the ``nlist`` lower ABI (virtual-spin scheme, used by SeZM
-       spin models) is supported for spin.  The ``edge_vec`` ABI (native
-       spin) is not yet supported by this path.
+    The initial legacy-GPU implementation deliberately supports only the
+    ordinary non-spin SeZM/DPA4 energy ABI with no ``fparam``, ``aparam``, or
+    ``charge_spin`` inputs. Runtime compatibility with Pascal / P100 must be
+    validated separately on a real P100 system.
 
     Parameters
     ----------
@@ -2002,12 +2014,15 @@ def freeze_sezm_to_pth(
     dim_fparam = int(model.get_dim_fparam())
     dim_aparam = int(model.get_dim_aparam())
     dim_chg_spin = int(model.get_dim_chg_spin())
-    if is_spin and dim_chg_spin > 0:
-        raise ValueError(
-            "SeZM spin models do not support charge_spin. "
-            "dim_chg_spin must be 0 for the .pth freeze path. "
-            "Use the .pt2 freeze path (dp --pt freeze without --legacy-gpu) "
-            "for models with spin+charge."
+    if is_spin:
+        raise NotImplementedError(
+            "The legacy .pth exporter currently supports only non-spin "
+            "SeZM/DPA4 energy models."
+        )
+    if dim_fparam != 0 or dim_aparam != 0 or dim_chg_spin != 0:
+        raise NotImplementedError(
+            "The legacy .pth exporter currently supports only models with "
+            "dim_fparam=dim_aparam=dim_chg_spin=0."
         )
     type_map = list(model.get_type_map())
     has_mp = _model_has_message_passing(model)
@@ -2076,23 +2091,11 @@ def freeze_sezm_to_pth(
             )
 
     # --- Two-stage tracing ---
-    # Stage 1: Trace the FX GraphModule into a self-contained ScriptModule
-    # via a concrete adapter with explicit tensor signatures (no ``*args``,
-    # no ``Any``).  This avoids the ``from __future__ import annotations``
-    # issue where ``Any`` becomes the unresolvable string ``'Any'``, and
-    # the FX GraphModule's internal type name (``_dict_str_torch_Tensor_``)
-    # that TorchScript cannot resolve.
-    #
-    # The FullParam adapter is always used because ``forward_lower`` always
-    # passes the full 9-arg (energy) or 8-arg (spin) tuple to
-    # ``self.lower_graph()``, and the traced ``ScriptModule`` must accept
-    # the same positional signature.
-    if is_spin:
-        adapter = LowerGraphSpinFullParamAdapter(traced).eval()
-        lower_trace_inputs = list(sample_inputs_cpu[:8])
-    else:
-        adapter = LowerGraphFullParamAdapter(traced).eval()
-        lower_trace_inputs = list(sample_inputs_cpu[:9])
+    # Stage 1: convert the FX GraphModule into a self-contained ScriptModule
+    # through the concrete no-parameter energy ABI. The trace boundary receives
+    # exactly six Tensor inputs; no None or Optional[Tensor] value crosses it.
+    adapter = LowerGraphNoParamAdapter(traced).eval()
+    lower_trace_inputs = list(sample_inputs_cpu[:6])
     log.info(
         "Stage 1: tracing the FX lower graph into a ScriptModule...",
     )
@@ -2141,10 +2144,7 @@ def freeze_sezm_to_pth(
     }
 
     log.info("Stage 2: scripting the LAMMPS-facing wrapper...")
-    if is_spin:
-        wrapper = SeZMSpinPTHModel(scripted_lower, **common_kwargs)
-    else:
-        wrapper = SeZMPTHModel(scripted_lower, **common_kwargs)
+    wrapper = SeZMPTHModel(scripted_lower, **common_kwargs)
     wrapper.eval()
     try:
         traced_module = torch.jit.script(wrapper)
@@ -2171,11 +2171,9 @@ def freeze_sezm_to_pth(
         target_device,
         output_keys,
     )
-    loader_name = "DeepSpinPT" if is_spin else "DeepPotPT"
     log.info(
-        "The .pth model can be loaded by LAMMPS via %s on any CUDA GPU "
-        "(Pascal P100 / sm_60+ supported, no Triton required).",
-        loader_name,
+        "The .pth model was exported for the DeepPotPT LAMMPS interface. "
+        "P100 runtime compatibility has not been verified by this export step."
     )
     _log_dpa4_citation()
 

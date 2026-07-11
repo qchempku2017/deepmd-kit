@@ -20,6 +20,19 @@ works). A **Pascal (P100)** user needs bf16 off and the `.pth` freeze path
 for LAMMPS; training and `dp --pt test` still use the dense eager path.
 :::
 
+> **⚠️ Deprecation Notice — Spin Model `.pth` Freeze Dropped**
+>
+> As of this update, **spin model freezing to `.pth` (TorchScript) is no longer
+> supported** via the `dp --pt freeze --legacy-gpu` command. The
+> `SeZMSpinPTHModel` wrapper class has been disabled, and the `--legacy-gpu`
+> flag's `.pth` freeze path no longer handles spin models. Only **energy
+> (non-spin) models** can be frozen to `.pth` through this path.
+>
+> Spin model **`.pt2` (AOTInductor) freezing** via `dp --pt freeze` (without
+> `--legacy-gpu`) **continues to work on Volta (`sm_70`) and newer GPUs**,
+> including the `DeepSpinPTExpt` C++ loader in LAMMPS. Pascal (`sm_60`) users
+> who need spin model deployment must upgrade to a Volta+ GPU.
+
 ## Quick Start for P100/Pascal GPUs
 
 :::{tip}
@@ -36,18 +49,18 @@ Pascal GPU:
 dp --pt train input.json
 
 # Step 2: Freeze with --legacy-gpu flag (produces .pth instead of .pt2)
+# Note: only energy (non-spin) models are supported
 dp --pt freeze --legacy-gpu -c checkpoint.pt -o frozen_model.pth
 
-# Step 3: Use in LAMMPS (same as any other .pth model)
+# Step 3: Use in LAMMPS
 # In LAMMPS input:
-#   Energy model:   pair_style deepmd frozen_model.pth
-#   Spin model:     pair_style deepmd/spin frozen_model.pth
+#   pair_style deepmd frozen_model.pth
 ```
 
 The `--legacy-gpu` flag converts the model to TorchScript (`.pth`) instead of
-AOTInductor (`.pt2`). The `.pth` file works with LAMMPS via the appropriate
-loader — ``DeepPotPT`` for energy models or ``DeepSpinPT`` for spin models
-(virtual-spin scheme). Performance is about 1.5–3× slower than `.pt2` on
+AOTInductor (`.pt2`). The `.pth` file works with LAMMPS via the ``DeepPotPT``
+loader for **energy models only**; spin model freezing is no longer supported
+through this path. Performance is about 1.5–3× slower than `.pt2` on
 Volta+ GPUs, but the model remains fully GPU-accelerated and does not fall
 back to CPU.
 
@@ -79,7 +92,7 @@ warning** on pre-Ampere GPUs.
 ## 2. Capability tiers at a glance
 
 | Family | Examples | Compute capability | native bf16 | `.pt2` / Triton / compile | `.pth` freeze / LAMMPS | What applies |
-|--------|----------|-------------------|-------------|---------------------------|------------------------|--------------| | Pascal | Tesla P100, GTX 10 | `sm_60`/`sm_62` | **no** | **no** | **✅ yes** (energy + spin) | bf16 auto-off; `.pth` freeze → LAMMPS (energy + spin via `DeepSpinPT`); dense eager for train/test |
+|--------|----------|-------------------|-------------|---------------------------|------------------------|--------------| | Pascal | Tesla P100, GTX 10 | `sm_60`/`sm_62` | **no** | **no** | **✅ yes** (energy only) | bf16 auto-off; `.pth` freeze → LAMMPS (energy only, spin not supported); dense eager for train/test |
 | Volta | V100, Titan V | `sm_70`/`sm_72` | **no** | **yes** | yes (`.pt2` preferred) | bf16 auto-off; `.pt2`/compile/LAMMPS work |
 | Turing | RTX 20, T4 | `sm_75` | **no** | **yes** | yes (`.pt2` preferred) | bf16 auto-off; `.pt2`/compile/LAMMPS work |
 | Ampere | A100, RTX 30 | `sm_80`/`sm_86` | yes | yes | yes (`.pt2` preferred) | fully supported (all paths) |
@@ -266,10 +279,10 @@ What **works**:
 - ✅ DPA-4 inference in **LAMMPS** via the `.pth` frozen model:
   - **Energy models**: use ``pair_style deepmd frozen_model.pth`` with the
     standard ``DeepPotPT`` loader.
-  - **Spin models** (virtual-spin / deepspin scheme): use
-    ``pair_style deepmd/spin frozen_model.pth`` with the ``DeepSpinPT``
-    loader. Only the ``nlist`` lower ABI (SeZM spin models) is supported;
-    the ``edge_vec`` ABI (native spin) is not yet covered.
+  - **Spin models**: no longer supported by the `.pth` freeze path on Pascal.
+    The ``SeZMSpinPTHModel`` wrapper has been disabled. Spin model `.pt2`
+    (AOTInductor) freezing works on Volta (`sm_70`) and newer GPUs via
+    ``dp --pt freeze`` (without ``--legacy-gpu``).
 - ✅ Checkpoint save / resume (`model.ckpt.pt`).
 - ✅ Older DP / DPA-1 / DPA-2 / DPA-3 models — unaffected (their C++ ops
   compile for `sm_60`).
@@ -280,10 +293,14 @@ What **does not work** on Pascal:
   — AOTInductor lowers through Triton, which cannot compile for `sm_60`. The
   standard freeze now **fails fast** with an actionable message. Use
   `--legacy-gpu` for Pascal instead.
-- ❌ DPA-4 **native-spin** (``edge_vec`` ABI) models via the `.pth` freeze
-  path — only the ``nlist`` ABI (virtual-spin / deepspin scheme used by SeZM
-  spin models) is supported. Use the `.pt2` freeze path
-  (``dp --pt freeze`` without ``--legacy-gpu``) for native-spin models.
+- ❌ DPA-4 **spin model .pth freeze** (``--legacy-gpu``) — spin models (both
+  ``nlist`` ABI / virtual-spin deepspin scheme and ``edge_vec`` ABI / native
+  spin) cannot be frozen to ``.pth`` on Pascal; the ``SeZMSpinPTHModel``
+  wrapper has been disabled. Spin model **.pt2 (AOTInductor) freeze** works on
+  Volta+ GPUs.
+- ❌ ``dp --pt freeze`` of a spin model DPA-4 checkpoint to ``.pt2`` on Pascal
+  — same AOTInductor/Triton limitation as energy models (see above). Use a
+  Volta+ GPU for spin ``.pt2`` freeze.
 - ❌ `torch.compile` (`model.use_compile` / `DP_COMPILE_INFER`) — lowers through
   Triton; unsupported on `sm_60`. Setting either on Pascal now raises a clear
   `RuntimeError`.
@@ -352,26 +369,20 @@ The `--legacy-gpu` flag triggers a different freeze pipeline:
    performance warning). This is useful for debugging or when you need
    TorchScript portability across heterogeneous GPU clusters.
 
-5. **Spin model support — two wrapper classes**: The `.pth` freeze produces
-   different TorchScript modules depending on whether the model is an energy
-   or spin model:
+5. **Energy model wrapper**: The `.pth` freeze produces a TorchScript module
+   for **energy models only** (spin model `.pth` freezing is no longer
+   supported):
 
    - **Energy models** → ``SeZMPTHModel`` with a ``forward_lower`` that matches
      the ``DeepPotPT`` contract (``pair_style deepmd`` in LAMMPS): ``(coord,
      atype, nlist, mapping, ...)``. The wrapper converts the LAMMPS neighbour
      list to an edge schema before calling the traced lower graph.
-   - **Spin models** (virtual-spin scheme) → ``SeZMSpinPTHModel`` with a
-     ``forward_lower`` that matches the ``DeepSpinPT`` contract
-     (``pair_style deepmd/spin`` in LAMMPS): ``(coord, atype, extended_spin,
-     nlist, mapping, ...)``. The wrapper passes raw extended inputs through to
-     the traced lower graph, which places virtual atoms internally.
 
-   This design mirrors the C++ side where ``DeepPotPT`` and ``DeepSpinPT``
-   are already separate loaders with different ``forward_lower`` calling
-   conventions. No C++ changes were required — ``DeepSpinPT`` already calls
-   the correct signature. Only the ``nlist`` lower ABI (SeZM spin models,
-   ``export_lower_input_kind() → "nlist"``) is supported; the ``edge_vec``
-   ABI (native spin) is not yet covered.
+   The previously available ``SeZMSpinPTHModel`` wrapper (for spin models via
+   ``pair_style deepmd/spin`` and ``DeepSpinPT``) has been **disabled**. Spin
+   models can no longer be frozen to ``.pth`` through this path. However, spin
+   model **.pt2 (AOTInductor) freezing** via ``dp --pt freeze`` (without
+   ``--legacy-gpu``) continues to work on Volta+ GPUs.
 
 The trade-off is that Triton-fused kernels (used in the `.pt2` path) are
 faster than the equivalent sequence of individual PyTorch ops in the `.pth`
