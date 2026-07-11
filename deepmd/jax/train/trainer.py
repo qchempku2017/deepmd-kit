@@ -7,6 +7,7 @@ import logging
 import os
 import platform
 import shutil
+import time
 from collections.abc import (
     Mapping,
 )
@@ -41,6 +42,7 @@ from deepmd.dpmodel.train import (
     TrainingTask,
     TrainingTaskCollection,
     TrainStepResult,
+    change_model_out_bias_by_task,
 )
 from deepmd.dpmodel.train.validation import (
     resolve_best_checkpoint_dir,
@@ -197,8 +199,8 @@ class DPTrainer(AbstractTrainer):
         self.tensorboard_log_dir = tr_data.get("tensorboard_log_dir", "log")
         self.tensorboard_freq = tr_data.get("tensorboard_freq", 1)
         self.mixed_prec = tr_data.get("mixed_precision", None)
-        self.change_bias_after_training = tr_data.get(
-            "change_bias_after_training", False
+        self.change_bias_after_training = bool(
+            tr_data.get("change_bias_after_training", False)
         )
         self.numb_fparam = (
             {key: model.get_dim_fparam() for key, model in self.models.items()}
@@ -731,6 +733,39 @@ class DPTrainer(AbstractTrainer):
         """Persist a JAX checkpoint for a one-based step."""
         self._save_checkpoint(step)
 
+    def run(self, tasks: TrainingTaskCollection) -> None:
+        """Run JAX training through the backend-independent trainer loop."""
+        log.info("Start to train %d steps.", self.num_steps)
+        wall_start = time.time()
+        super().run(tasks)
+        if self.change_bias_after_training and self.num_steps > self.start_step:
+            self._change_bias_after_training()
+            if self.rank_context.is_chief:
+                self.save_checkpoint(self.num_steps)
+        log.info("Training finished. Total wall time: %.2fs", time.time() - wall_start)
+
+    def _change_bias_after_training(self) -> None:
+        if self.rank_context.is_chief:
+            change_model_out_bias_by_task(
+                self.models,
+                self._sample_funcs,
+                self.model_keys,
+                bias_adjust_mode="change-by-statistic",
+            )
+        if self.rank_context.world_size <= 1:
+            return
+        from jax.experimental import (
+            multihost_utils,
+        )
+
+        for model_key in self.model_keys:
+            _, state = nnx.split(self.models[model_key])
+            state = multihost_utils.broadcast_one_to_all(
+                state.to_pure_dict(),
+                is_source=self.rank_context.is_chief,
+            )
+            nnx.update(self.models[model_key], state)
+
     def run_full_validation(
         self,
         *,
@@ -806,8 +841,14 @@ class DPTrainer(AbstractTrainer):
         log.info(f"Trained model has been saved to: {ckpt_path!s}")
         _link_checkpoint(ckpt_path, Path(f"{self.save_ckpt}.jax"))
         self._cleanup_old_checkpoints()
-        with open("checkpoint", "w") as fp:
-            fp.write(f"{self.save_ckpt}.jax")
+        # Write the pointer next to the checkpoint prefix, with a value relative
+        # to that directory (basename only). The freeze entrypoint looks for the
+        # pointer inside the folder it is given and resolves the value relative
+        # to it, so a directory-valued save_ckpt would otherwise be unresolvable.
+        ckpt_dir = Path(self.save_ckpt).parent
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        with open(ckpt_dir / "checkpoint", "w") as fp:
+            fp.write(f"{Path(self.save_ckpt).name}.jax")
 
     def _save_full_validation_checkpoint(
         self,
