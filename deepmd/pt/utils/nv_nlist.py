@@ -306,7 +306,7 @@ def _matrix_to_extended_inputs(
         total_atoms, max_neighbors
     )
     valid = (slot < num_neighbors.unsqueeze(1)).reshape(-1)
-    edge_idx = torch.nonzero(valid, as_tuple=False).flatten()
+    edge_idx = torch.where(valid)[0]
     if edge_idx.numel() == 0:
         return coord, atype, local_mapping, nlist
 
@@ -328,14 +328,14 @@ def _matrix_to_extended_inputs(
     # === Step 2. Direct neighbors keep their local extended indices ===
     # Zero-shift neighbors already live in the leading local block of
     # `extended_coord`, so their DeePMD nlist value is simply `src_local`.
-    direct_edge_idx = torch.nonzero(zero_shift, as_tuple=False).flatten()
+    direct_edge_idx = torch.where(zero_shift)[0]
     nlist[
         frame_idx.index_select(0, direct_edge_idx),
         center_idx.index_select(0, direct_edge_idx),
         slot_idx.index_select(0, direct_edge_idx),
     ] = src_local.index_select(0, direct_edge_idx)
 
-    shifted_edge_idx = torch.nonzero(~zero_shift, as_tuple=False).flatten()
+    shifted_edge_idx = torch.where(~zero_shift)[0]
     if shifted_edge_idx.numel() == 0:
         return coord, atype, local_mapping, nlist
     if cell is None:

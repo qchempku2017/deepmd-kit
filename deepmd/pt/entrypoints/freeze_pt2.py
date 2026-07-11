@@ -203,7 +203,7 @@ def _build_edge_schema_ts(
     edge_scatter_all = edge_index_all
     edge_mask_all = valid_flat
     # Compact: keep only valid edges, mirroring edge_schema_from_extended.
-    valid_idx = torch.nonzero(valid_flat, as_tuple=False).flatten()
+    valid_idx = torch.where(valid_flat)[0]
     edge_index = edge_index_all[:, valid_idx]
     edge_vec = edge_vec_all[valid_idx]
     edge_scatter_index = edge_scatter_all[:, valid_idx]
@@ -1304,11 +1304,11 @@ class _LowerGraphWrapper(torch.nn.Module):
     TorchScript cannot resolve internal FX type names (e.g.
     ``_dict_str_torch_Tensor_``) when the graph is stored directly as a
     submodule of the top-level model being traced.  Wrapping it in a regular
-    ``nn.Module`` with a plain ``forward(*args, **kwargs)`` signature works
-    because ``torch.jit.trace`` only resolves the **direct** submodule's
-    class name for type-checking — it does not recurse into the type
-    hierarchy of nested submodules.  The tracer still records the call to
-    ``self._fx(*args, **kwargs)`` inline, so the FX graph is inlined into
+    ``nn.Module`` with a plain ``forward(*args)`` signature works because
+    ``torch.jit.trace`` only resolves the **direct** submodule's class name
+    for type-checking — it does not recurse into the type hierarchy of
+    nested submodules.  The tracer still records the call to
+    ``self._fx(*args)`` inline, so the FX graph is inlined into
     the traced TorchScript IR without ever exposing the FX type name to the
     type resolver.
     """
@@ -1317,8 +1317,8 @@ class _LowerGraphWrapper(torch.nn.Module):
         super().__init__()
         self._fx = fx_module
 
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        return self._fx(*args, **kwargs)
+    def forward(self, *args: Any) -> Any:
+        return self._fx(*args)
 
 
 class _BaseSeZMPTHModel(torch.nn.Module):

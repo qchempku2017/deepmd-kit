@@ -117,7 +117,7 @@ def edge_schema_from_extended(
     # cutoff-truncated by the caller (see the docstring). Only padding (-1),
     # ghost-only neighbours, and coincident pairs are dropped.
     edge_keep = valid_flat & (src_local >= 0) & (src_local < nloc) & (edge_len2 > 1e-10)
-    valid_idx = torch.nonzero(edge_keep, as_tuple=False).flatten()
+    valid_idx = torch.where(edge_keep)[0]
     edge_index = torch.stack(
         [
             src_actual.index_select(0, valid_idx),
@@ -168,7 +168,7 @@ def edge_schema_from_neighbor_matrix(
         total_atoms, max_neighbors
     )
     valid = (slot < num_neighbors.unsqueeze(1)).reshape(-1)
-    edge_idx = torch.nonzero(valid, as_tuple=False).flatten()
+    edge_idx = torch.where(valid)[0]
     if edge_idx.numel() == 0:
         empty = _append_dummy_edges(
             torch.zeros((2, 0), dtype=torch.long, device=device),
@@ -191,9 +191,7 @@ def edge_schema_from_neighbor_matrix(
     )
 
     if cell is not None:
-        shifted_idx = torch.nonzero(
-            torch.any(shift != 0, dim=1), as_tuple=False
-        ).flatten()
+        shifted_idx = torch.where(torch.any(shift != 0, dim=1))[0]
         if shifted_idx.numel() > 0:
             shift_cart = torch.bmm(
                 shift.index_select(0, shifted_idx).to(dtype=coord.dtype).unsqueeze(1),
@@ -203,7 +201,7 @@ def edge_schema_from_neighbor_matrix(
 
     edge_len2 = torch.sum(edge_vec_all * edge_vec_all, dim=-1)
     edge_keep = (edge_len2 > 1e-10) & (edge_len2 <= float(rcut) * float(rcut))
-    valid_idx = torch.nonzero(edge_keep, as_tuple=False).flatten()
+    valid_idx = torch.where(edge_keep)[0]
     schema = _append_dummy_edges(
         torch.stack(
             [
@@ -253,9 +251,7 @@ def edge_schema_from_ij_shifts(
     shifts = shifts.to(dtype=positions.dtype)
     edge_vec_all = positions.index_select(0, jj) - positions.index_select(0, ii)
     if cell is not None:
-        shifted_idx = torch.nonzero(
-            torch.any(shifts != 0, dim=1), as_tuple=False
-        ).flatten()
+        shifted_idx = torch.where(torch.any(shifts != 0, dim=1))[0]
         if shifted_idx.numel() > 0:
             edge_vec_all.index_add_(
                 0,
@@ -264,7 +260,7 @@ def edge_schema_from_ij_shifts(
             )
     edge_len2 = torch.sum(edge_vec_all * edge_vec_all, dim=-1)
     edge_keep = (edge_len2 > 1e-10) & (edge_len2 <= float(rcut) * float(rcut))
-    valid_idx = torch.nonzero(edge_keep, as_tuple=False).flatten()
+    valid_idx = torch.where(edge_keep)[0]
     schema = _append_dummy_edges(
         torch.stack(
             [

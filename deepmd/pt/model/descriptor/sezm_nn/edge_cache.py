@@ -760,7 +760,7 @@ def _build_standard_edge_index(
     # cache and will later get edge_env=0 from the cutoff envelope.
     valid_nlist = nlist >= 0
     edge_keep = (valid_nlist & pair_keep_mask).reshape(-1)
-    edge_slot = torch.nonzero(edge_keep).squeeze(-1).to(dtype=torch.long)
+    edge_slot = torch.where(edge_keep)[0].to(dtype=torch.long)
 
     if edge_slot.numel() == 0:
         empty = torch.empty(0, dtype=torch.long, device=nlist.device)

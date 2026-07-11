@@ -90,7 +90,7 @@ def nv_matrix_to_ijs(
         total_atoms, max_neighbors
     )
     valid = (slot < num_neighbors.unsqueeze(1)).reshape(-1)
-    edge_idx = torch.nonzero(valid, as_tuple=False).flatten()
+    edge_idx = torch.where(valid)[0]
 
     dst = edge_idx // max_neighbors  # flattened center
     src = neighbor_matrix.reshape(-1).index_select(0, edge_idx).to(torch.int64)
