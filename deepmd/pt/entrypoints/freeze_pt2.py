@@ -1120,6 +1120,8 @@ def freeze_sezm_to_pt2(
     # eager mode, so no freeze is needed for Python inference; LAMMPS DPA4/SeZM
     # requires a Volta-or-newer GPU. `DP_FREEZE_FORCE_AOTI=1` is an escape hatch
     # for a custom Triton build that does support a Pascal device.
+    # NOTE: This check mirrors assert_triton_supported_gpu() in
+    # deepmd.kernels.utils; keep the sm_70 threshold in sync.
     force_aoti = os.environ.get("DP_FREEZE_FORCE_AOTI", "0").strip().lower() in (
         "1",
         "true",
