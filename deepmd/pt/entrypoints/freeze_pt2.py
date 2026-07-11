@@ -1302,34 +1302,260 @@ def _format_nlist_to_nnei(nlist: torch.Tensor, nnei_target: int) -> torch.Tensor
     return fnlist.contiguous()
 
 
-class _LowerGraphWrapper(torch.nn.Module):
-    """Thin wrapper that hides an FX GraphModule from TorchScript type checks.
+class LowerGraphNoParamAdapter(torch.nn.Module):
+    """Concrete adapter for FX lower graphs with no optional params.
 
-    TorchScript cannot resolve internal FX type names (e.g.
-    ``_dict_str_torch_Tensor_``) when the graph is stored directly as a
-    submodule of the top-level model being traced.  Wrapping it in a regular
-    ``nn.Module`` with a plain ``forward(*args)`` signature works because
-    ``torch.jit.trace`` only resolves the **direct** submodule's class name
-    for type-checking — it does not recurse into the type hierarchy of
-    nested submodules.  The tracer still records the call to
-    ``self._fx(*args)`` inline, so the FX graph is inlined into
-    the traced TorchScript IR without ever exposing the FX type name to the
-    type resolver.
-
-    ``forward`` carries ``@torch.jit.ignore`` so that the FX graph is
-    treated as an opaque eager-mode call instead of being inlined into the
-    TorchScript IR.  This avoids JIT-compilation issues with FX-generated
-    operators on legacy GPU hardware where certain TorchScript-compiled
-    kernels may be unsupported or produce incorrect results.
+    Wraps an FX GraphModule and exposes a fixed TorchScript-compatible
+    signature with explicit tensor types.  Used as the first stage of
+    two-stage tracing: the adapter is ``torch.jit.trace``-ed into a
+    self-contained ``ScriptModule`` that can then be stored inside the
+    LAMMPS-facing ``SeZMPTHModel`` / ``SeZMSpinPTHModel`` wrapper.
     """
 
-    def __init__(self, fx_module: torch.nn.Module) -> None:
+    def __init__(self, graph: torch.nn.Module) -> None:
         super().__init__()
-        self._fx = fx_module
+        self.graph = graph
 
-    @torch.jit.ignore
-    def forward(self, *args: Any) -> Any:
-        return self._fx(*args)
+    def forward(
+        self,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_scatter_index: torch.Tensor,
+        edge_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return self.graph(
+            coord,
+            atype,
+            edge_index,
+            edge_vec,
+            edge_scatter_index,
+            edge_mask,
+            None,
+            None,
+            None,
+        )
+
+
+class LowerGraphFParamAdapter(torch.nn.Module):
+    """Concrete adapter for FX lower graphs with fparam only."""
+
+    def __init__(self, graph: torch.nn.Module) -> None:
+        super().__init__()
+        self.graph = graph
+
+    def forward(
+        self,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_scatter_index: torch.Tensor,
+        edge_mask: torch.Tensor,
+        fparam: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return self.graph(
+            coord,
+            atype,
+            edge_index,
+            edge_vec,
+            edge_scatter_index,
+            edge_mask,
+            fparam,
+            None,
+            None,
+        )
+
+
+class LowerGraphFullParamAdapter(torch.nn.Module):
+    """Concrete adapter for FX lower graphs with all optional params."""
+
+    def __init__(self, graph: torch.nn.Module) -> None:
+        super().__init__()
+        self.graph = graph
+
+    def forward(
+        self,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_scatter_index: torch.Tensor,
+        edge_mask: torch.Tensor,
+        fparam: torch.Tensor,
+        aparam: torch.Tensor,
+        charge_spin: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return self.graph(
+            coord,
+            atype,
+            edge_index,
+            edge_vec,
+            edge_scatter_index,
+            edge_mask,
+            fparam,
+            aparam,
+            charge_spin,
+        )
+
+
+class LowerGraphSpinNoParamAdapter(torch.nn.Module):
+    """Concrete adapter for spin FX lower graphs with no optional params.
+
+    Matches the nlist ABI: (extended_coord, extended_atype, extended_spin,
+    nlist, mapping).
+    """
+
+    def __init__(self, graph: torch.nn.Module) -> None:
+        super().__init__()
+        self.graph = graph
+
+    def forward(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        extended_spin: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return self.graph(
+            extended_coord,
+            extended_atype,
+            extended_spin,
+            nlist,
+            mapping,
+            None,
+            None,
+            None,
+        )
+
+
+class LowerGraphSpinFParamAdapter(torch.nn.Module):
+    """Concrete adapter for spin FX lower graphs with fparam only."""
+
+    def __init__(self, graph: torch.nn.Module) -> None:
+        super().__init__()
+        self.graph = graph
+
+    def forward(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        extended_spin: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor,
+        fparam: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return self.graph(
+            extended_coord,
+            extended_atype,
+            extended_spin,
+            nlist,
+            mapping,
+            fparam,
+            None,
+            None,
+        )
+
+
+class LowerGraphSpinFullParamAdapter(torch.nn.Module):
+    """Concrete adapter for spin FX lower graphs with all optional params."""
+
+    def __init__(self, graph: torch.nn.Module) -> None:
+        super().__init__()
+        self.graph = graph
+
+    def forward(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        extended_spin: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor,
+        fparam: torch.Tensor,
+        aparam: torch.Tensor,
+        charge_spin: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return self.graph(
+            extended_coord,
+            extended_atype,
+            extended_spin,
+            nlist,
+            mapping,
+            fparam,
+            aparam,
+            charge_spin,
+        )
+
+
+def _select_lower_adapter(
+    dim_fparam: int,
+    dim_aparam: int,
+    dim_chg_spin: int,
+    is_spin: bool = False,
+) -> type[torch.nn.Module]:
+    """Select the appropriate concrete adapter class for the lower graph.
+
+    Always returns the ``FullParam`` variant because the LAMMPS-facing
+    ``forward_lower`` methods always pass the full positional tuple
+    (9 args for energy, 8 args for spin) to ``self.lower_graph()``,
+    and the traced ``ScriptModule`` must accept the same signature.
+
+    Parameters
+    ----------
+    dim_fparam : int
+        Frame-level parameter dimension.
+    dim_aparam : int
+        Atom-level parameter dimension.
+    dim_chg_spin : int
+        Charge / spin channel dimension.
+    is_spin : bool
+        Whether the lower graph follows the spin (nlist) ABI.
+
+    Returns
+    -------
+    type[torch.nn.Module]
+        ``LowerGraphFullParamAdapter`` or ``LowerGraphSpinFullParamAdapter``.
+    """
+    if is_spin:
+        return LowerGraphSpinFullParamAdapter
+    else:
+        return LowerGraphFullParamAdapter
+
+
+def _build_lower_trace_inputs(
+    sample_inputs: tuple[torch.Tensor | None, ...],
+    dim_fparam: int,
+    dim_aparam: int,
+    dim_chg_spin: int,
+    is_spin: bool = False,
+) -> list[torch.Tensor]:
+    """Build the trace inputs for the FullParam adapter from the full sample.
+
+    Always returns the full positional tuple because ``_select_lower_adapter``
+    always selects the ``FullParam`` variant, and the traced ``ScriptModule``
+    must match the 9-arg (energy) or 8-arg (spin) signature that
+    ``forward_lower`` uses.
+
+    Parameters
+    ----------
+    sample_inputs
+        The full sample tuple from ``_make_sample_inputs``.
+    dim_fparam, dim_aparam, dim_chg_spin
+        Unused; retained for API compatibility.
+    is_spin
+        If True, returns the 8-element spin (nlist) ABI prefix.
+
+    Returns
+    -------
+    list[torch.Tensor]
+        The full prefix of sample_inputs (9 for energy, 8 for spin).
+    """
+    if is_spin:
+        return list(sample_inputs[:8])
+    else:
+        return list(sample_inputs[:9])
 
 
 class _BaseSeZMPTHModel(torch.nn.Module):
@@ -1379,7 +1605,7 @@ class _BaseSeZMPTHModel(torch.nn.Module):
         do_grad_c: bool,
     ) -> None:
         super().__init__()
-        self.lower_graph = _LowerGraphWrapper(lower_graph)
+        self.lower_graph = lower_graph
         self._rcut = rcut
         self._ntypes = ntypes
         self._sel = sel
@@ -1847,10 +2073,44 @@ def freeze_sezm_to_pth(
                 exc_info=True,
             )
 
-    # --- Trace / script the wrapper ---
-    # Build the appropriate wrapper and LAMMPS-level trace inputs.
-    # Spin models → SeZMSpinPTHModel (DeepSpinPT contract: extended_spin
-    # between atype and nlist).  Non-spin → SeZMPTHModel (DeepPotPT contract).
+    # --- Two-stage tracing ---
+    # Stage 1: Trace the FX GraphModule into a self-contained ScriptModule
+    # via a concrete adapter with explicit tensor signatures (no ``*args``,
+    # no ``Any``).  This avoids the ``from __future__ import annotations``
+    # issue where ``Any`` becomes the unresolvable string ``'Any'``, and
+    # the FX GraphModule's internal type name (``_dict_str_torch_Tensor_``)
+    # that TorchScript cannot resolve.
+    #
+    # The FullParam adapter is always used because ``forward_lower`` always
+    # passes the full 9-arg (energy) or 8-arg (spin) tuple to
+    # ``self.lower_graph()``, and the traced ``ScriptModule`` must accept
+    # the same positional signature.
+    if is_spin:
+        adapter = LowerGraphSpinFullParamAdapter(traced).eval()
+        lower_trace_inputs = list(sample_inputs_cpu[:8])
+    else:
+        adapter = LowerGraphFullParamAdapter(traced).eval()
+        lower_trace_inputs = list(sample_inputs_cpu[:9])
+    log.info(
+        "Stage 1: tracing the FX lower graph into a ScriptModule...",
+    )
+    try:
+        scripted_lower = torch.jit.trace(
+            adapter, lower_trace_inputs, strict=False, check_trace=True
+        )
+        log.info("Stage 1 succeeded: lower graph traced to ScriptModule.")
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to convert the FX lower graph into a self-contained "
+            "TorchScript module.\n"
+            "This failure occurred before CUDA or P100 execution.\n"
+            "Run the standalone lower-graph validation in a PyTorch-enabled "
+            "environment.\n"
+            f"Original error: {e}"
+        ) from e
+
+    # Stage 2: Build the LAMMPS-facing wrapper with the scripted lower graph
+    # and script the whole model.
     common_kwargs = {
         "sel": sel,
         "rcut": rcut,
@@ -1878,115 +2138,23 @@ def freeze_sezm_to_pth(
         "do_grad_c": do_grad_c,
     }
 
-    lammps_ext_coord = ext_coord  # (1, nall, 3)
-    lammps_ext_atype = ext_atype  # (1, nall)
-    lammps_nlist = nlist_t  # (1, nloc, nsel)
-    lammps_mapping = mapping_t  # (1, nall)
-    lammps_fparam = (
-        torch.zeros(1, dim_fparam, dtype=torch.float64) if dim_fparam > 0 else None
-    )
-    lammps_aparam = (
-        torch.zeros(1, _PTH_SAMPLE_NLOC, dim_aparam, dtype=torch.float64)
-        if dim_aparam > 0
-        else None
-    )
-    lammps_chg_spin = (
-        torch.zeros(1, dim_chg_spin, dtype=torch.float64) if dim_chg_spin > 0 else None
-    )
-
+    log.info("Stage 2: scripting the LAMMPS-facing wrapper...")
     if is_spin:
-        log.info("Converting spin FX graph to TorchScript (torch.jit.trace)...")
-        wrapper = SeZMSpinPTHModel(traced, **common_kwargs)
-        wrapper.eval()
-        # DeepSpinPT passes: coord, atype, spin, nlist, mapping,
-        # fparam, aparam, do_atomic_virial[, comm_dict].
-        # ext_tensors = (coord, atype, nlist, mapping, spin, fparam, aparam, chg_spin)
-        _, _, _, _, lammps_ext_spin, _, _, _ = ext_tensors  # (1, nall, 3)
-        trace_inputs = (
-            lammps_ext_coord,
-            lammps_ext_atype,
-            lammps_ext_spin,
-            lammps_nlist,
-            lammps_mapping,
-            lammps_fparam,
-            lammps_aparam,
-            atomic_virial,
-            None,  # comm_dict
-        )
+        wrapper = SeZMSpinPTHModel(scripted_lower, **common_kwargs)
     else:
-        log.info("Converting FX graph to TorchScript (torch.jit.trace)...")
-        wrapper = SeZMPTHModel(traced, **common_kwargs)
-        wrapper.eval()
-        trace_inputs = (
-            lammps_ext_coord,
-            lammps_ext_atype,
-            lammps_nlist,
-            lammps_mapping,
-            lammps_fparam,
-            lammps_aparam,
-            atomic_virial,
-            None,  # comm_dict
-            lammps_chg_spin,
-        )
-
+        wrapper = SeZMPTHModel(scripted_lower, **common_kwargs)
+    wrapper.eval()
     try:
-        traced_module = torch.jit.trace_module(
-            wrapper,
-            {"forward_lower": trace_inputs},
-        )
-        log.info("TorchScript tracing succeeded.")
+        traced_module = torch.jit.script(wrapper)
+        log.info("Stage 2 succeeded: LAMMPS-facing wrapper scripted.")
     except Exception as e:
-        log.warning(
-            "torch.jit.trace failed: %s. Falling back to torch.jit.script. "
-            "The frozen model may have untraced control-flow branches; "
-            "verify with `dp --pt test` before deploying to LAMMPS.",
-            e,
-        )
-        try:
-            traced_module = torch.jit.script(wrapper)
-            log.info("TorchScript scripting succeeded.")
-            # Validate that the scripted model produces the same output as
-            # the original wrapper on the trace sample inputs.
-            with torch.no_grad():
-                ref_out = wrapper.forward_lower(*trace_inputs)
-                ts_out = traced_module.forward_lower(*trace_inputs)
-            mismatches = []
-            for key in ref_out:
-                if key not in ts_out:
-                    mismatches.append(f"  {key}: missing in scripted output")
-                    continue
-                ref_val = ref_out[key]
-                ts_val = ts_out[key]
-                if ref_val.shape != ts_val.shape:
-                    mismatches.append(
-                        f"  {key}: shape mismatch "
-                        f"ref={tuple(ref_val.shape)} "
-                        f"scripted={tuple(ts_val.shape)}"
-                    )
-                    continue
-                max_diff = float((ref_val.float() - ts_val.float()).abs().max())
-                if max_diff > 1e-5:
-                    mismatches.append(f"  {key}: max abs diff={max_diff:.2e}")
-            if mismatches:
-                log.error(
-                    "TorchScript fallback output validation FAILED:\n%s\n"
-                    "The scripted model produces different results than the "
-                    "original. The .pth model may be incorrect -- do not "
-                    "deploy to LAMMPS without verifying with `dp --pt test`.",
-                    "\n".join(mismatches),
-                )
-            else:
-                log.info(
-                    "TorchScript fallback output validation passed "
-                    "(all %d keys match within 1e-5).",
-                    len(ref_out),
-                )
-        except Exception as e2:
-            raise RuntimeError(
-                f"Failed to convert SeZM model to TorchScript: {e2}. "
-                f"The model may use operations not supported by TorchScript. "
-                f"Try using freeze_sezm_to_pt2() for AOTInductor export instead."
-            ) from e2
+        raise RuntimeError(
+            "The lower graph conversion stage completed, but the LAMMPS-facing "
+            "wrapper could not be scripted.\n"
+            "Run the complete CPU wrapper validation in a PyTorch-enabled "
+            "environment.\n"
+            f"Original error: {e}"
+        ) from e
 
     # --- Move to target device ---
     if target_device.type != "cpu":
@@ -2017,4 +2185,3 @@ __all__ = [
     "freeze_sezm_to_pth",
     "is_sezm_checkpoint",
 ]
-
