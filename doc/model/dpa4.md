@@ -427,15 +427,18 @@ matter:
   (`sm_70`), and Turing (`sm_75`) lack native bf16, so `descriptor.use_amp`
   / `DP_AMP_INFER` is auto-disabled with a one-time warning; use the fp32
   dense path (or the fp32 `.pt2` on Volta/Turing).
-- **Triton / `torch.compile` / `.pt2` freeze / LAMMPS (needs Volta
-  `sm_70+`):** Triton (shipped with PyTorch 2.11/2.12) supports Volta and
-  newer but **cannot compile for Pascal (`sm_60`)** (AOTInductor is
-  confirmed broken on P100). So on Pascal, `dp --pt freeze` to `.pt2`,
-  `torch.compile` (`model.use_compile` / `DP_COMPILE_INFER`), Triton kernels
-  (`DP_TRITON_INFER`), and DPA-4 LAMMPS inference are **unavailable** and
-  fail fast with an actionable message. **Volta (V100, confirmed by testing)
-  and Turing (expected) support `.pt2` freeze and LAMMPS DPA-4** (only bf16
-  stays off there).
+- **Triton / ``torch.compile`` / ``.pt2`` freeze / LAMMPS (needs Volta
+  ``sm_70+``):** Triton (shipped with PyTorch 2.11/2.12) supports Volta and
+  newer but **cannot compile for Pascal (``sm_60``)** (AOTInductor is
+  confirmed broken on P100). So on Pascal, ``dp --pt freeze`` to ``.pt2``,
+  ``torch.compile`` (``model.use_compile`` / ``DP_COMPILE_INFER``), and
+  Triton kernels (``DP_TRITON_INFER``) are **unavailable** and fail fast
+  with an actionable message. An **experimental** ``.pth`` (TorchScript)
+  freeze path (``dp --pt freeze --legacy-gpu``) avoids Triton and is
+  available for non-spin, no-parameter energy models, but P100 CUDA and
+  LAMMPS runtime validation is **pending**. **Volta (V100, confirmed by
+  testing) and Turing (expected) support ``.pt2`` freeze and LAMMPS DPA-4**
+  (only bf16 stays off there).
 
 Training, `dp --pt test`, and the ASE calculator work on all of these by
 loading the `.pt` checkpoint directly (no freeze needed). Keep
@@ -457,26 +460,31 @@ dp --pt freeze -c model.ckpt.pt -o frozen_model
 
 The PyTorch backend detects DPA4/SeZM and writes `frozen_model.pt2`.
 
-### Freezing for Legacy GPUs (Pascal/P100, `sm_60`)
+### Freezing for Legacy GPUs (Pascal/P100, `sm_60`) — Experimental
 
-If you need to run DPA-4 in LAMMPS on a Pascal GPU (e.g., Tesla P100, `sm_60`),
-use the `--legacy-gpu` flag to produce a TorchScript `.pth` file instead of
-`.pt2`:
+An **experimental** TorchScript ``.pth`` export path is available for non-spin,
+no-parameter DPA4/SeZM energy models targeting Pascal-class GPUs:
 
 ```bash
 dp --pt freeze --legacy-gpu -c model.ckpt.pt -o frozen_model.pth
 ```
 
-This path uses `make_fx` + TorchScript (`torch.jit.trace`) instead of
-AOTInductor, so it **does not require Triton** and works on any CUDA GPU.
-The resulting `.pth` file loads through the standard `DeepPotPT` loader in
-LAMMPS, the same as any other `.pth` frozen model.
+This path uses ``make_fx`` + TorchScript (``torch.jit.trace``) instead of
+AOTInductor, so it **does not require Triton**. **Important caveats:**
+
+- **Validation is CPU-only**: the ``.pth`` path has been validated structurally
+  on CPU; P100/Pascal GPU runtime and LAMMPS integration have **not yet been
+  verified**.
+- **PyTorch must include ``sm_60`` kernels** for Pascal support.
+- **Spin models, ``fparam``, ``aparam``, and ``charge_spin`` are not supported**
+  by this path.
 
 :::{note}
-**Performance trade-off:** The `.pth` path is typically 1.5–3× slower than
-`.pt2` on Volta+ because it lacks Triton-fused kernels, but it is fully
-GPU-accelerated. On Volta+ GPUs, prefer the standard `.pt2` freeze. On
-Pascal, `.pth` is the only option.
+**Performance trade-off:** On Volta+ GPUs, the ``.pth`` path is typically
+1.5–3× slower than ``.pt2`` (measured on Volta-class hardware) because it
+lacks Triton-fused kernels. Pascal performance characteristics are unknown.
+On Volta+, use the standard ``.pt2`` freeze for production. On Pascal,
+``.pth`` is the only option, but treat it as experimental and unverified.
 :::
 
 See [Install and run on legacy NVIDIA GPUs](../install/install-legacy-gpu.md)
@@ -647,16 +655,21 @@ closed over the one-hop neighbor shell.
 ## Limitations
 
 - DPA4/SeZM is implemented for the PyTorch backend only.
-- Export uses `.pt2` (AOTInductor) by default; a `.pth` (TorchScript) freeze
-  path is available for legacy GPUs via `dp --pt freeze --legacy-gpu`.
+- Export uses ``.pt2`` (AOTInductor) by default for Volta+ GPUs (production).
+  An **experimental** ``.pth`` (TorchScript) freeze path is available for
+  Pascal-class GPUs via ``dp --pt freeze --legacy-gpu``, but it is
+  CPU-validated only — P100 CUDA and LAMMPS runtime validation is pending.
 - Model compression is not supported.
-- Multi-GPU (MPI) LAMMPS inference is supported for the plain energy model;
+- Multi-GPU (MPI) LAMMPS inference is supported for the plain energy model
+  via ``.pt2``; ``.pth`` multi-rank correctness is **unverified**.
   ZBL zone bridging and spin models run on a single MPI rank.
-- **Spin model `.pth` freezing is not supported**: spin models (native or
-  deepspin scheme) cannot be frozen to `.pth` via ``dp --pt freeze
+- **Spin model ``.pth`` freezing is not supported**: spin models (native or
+  deepspin scheme) cannot be frozen to ``.pth`` via ``dp --pt freeze
   --legacy-gpu``; the ``SeZMSpinPTHModel`` wrapper has been disabled. Spin
-  model **`.pt2` (AOTInductor) freezing** via ``dp --pt freeze`` (without
+  model **``.pt2`` (AOTInductor) freezing** via ``dp --pt freeze`` (without
   ``--legacy-gpu``) works on Volta+ GPUs.
+- ``fparam``, ``aparam``, and ``charge_spin`` model parameters are **not
+  supported** by the ``.pth`` freeze path.
 
 ## Citation
 

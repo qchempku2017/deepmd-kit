@@ -36,9 +36,11 @@ for LAMMPS; training and `dp --pt test` still use the dense eager path.
 ## Quick Start for P100/Pascal GPUs
 
 :::{tip}
-**Good news:** DPA-4 now supports LAMMPS on P100/Pascal GPUs through a new
-`.pth` (TorchScript) freeze path. You no longer need Volta+ to run DPA-4
-in LAMMPS.
+An experimental `.pth` (TorchScript) freeze path is available for
+non-spin, no-parameter DPA4/SeZM energy models. The path avoids Triton and
+AOTInductor and is intended for Pascal-class GPUs. CPU-side structural and
+numerical validation is available, but real P100 CUDA and LAMMPS runtime
+validation must be performed separately.
 :::
 
 Here is the complete workflow from training to LAMMPS on a P100 or other
@@ -58,15 +60,38 @@ dp --pt freeze --legacy-gpu -c checkpoint.pt -o frozen_model.pth
 ```
 
 The `--legacy-gpu` flag converts the model to TorchScript (`.pth`) instead of
-AOTInductor (`.pt2`). The `.pth` file works with LAMMPS via the ``DeepPotPT``
-loader for **energy models only**; spin model freezing is no longer supported
-through this path. Performance is about 1.5–3× slower than `.pt2` on
-Volta+ GPUs, but the model remains fully GPU-accelerated and does not fall
-back to CPU.
+AOTInductor (`.pt2`). The `.pth` TorchScript export is **experimental**: it has
+been validated structurally on CPU, but P100/Pascal GPU runtime compatibility
+has **not yet been verified**. PyTorch must itself contain `sm_60` kernels for
+Pascal support. The `.pth` file targets LAMMPS via the ``DeepPotPT`` loader for
+**energy models only**; spin model freezing is no longer supported through this
+path.
+
+On Volta+ GPUs, the `.pth` path is typically 1.5–3× slower than `.pt2`
+(measured on Volta-class hardware). Pascal performance characteristics are
+unknown.
 
 If you are on Volta (`sm_70`) or newer, use the standard `.pt2` freeze path
 (`dp --pt freeze -c checkpoint.pt -o frozen_model.pt2` without `--legacy-gpu`)
 for the best performance.
+
+## Validation Status
+
+The ``.pth`` TorchScript freeze path has the following validation status:
+
+| Check | Status |
+|-------|--------|
+| CPU structural tests | ✅ Passed |
+| P100 CUDA runtime | ⚠️ Not yet verified |
+| LAMMPS single-rank | ⚠️ Not yet verified |
+| LAMMPS multi-rank (MPI) | ⚠️ Not yet verified |
+| Spin models | ❌ Not supported |
+| Optional parameters (``fparam``/``aparam``/``charge_spin``) | ❌ Not supported |
+
+**All current development validation is CPU-only.** P100/Pascal GPU runtime
+testing and LAMMPS integration testing must be performed on actual hardware.
+See [P100/Pascal GPU Validation Checklist](p100-validation-checklist.md) for
+the complete set of steps to validate the ``.pth`` path on real Pascal hardware.
 
 ## 1. Why pre-Ampere GPUs need care
 
@@ -274,8 +299,9 @@ What **works**:
 - ✅ DPA-4 inference via `dp --pt test` and the ASE calculator, loading the
   `.pt` checkpoint eagerly.
 - ✅ `dp --pt freeze --legacy-gpu` — converts the model to TorchScript `.pth`
-  format, which works in LAMMPS on any CUDA GPU (see
-  [Quick Start](#quick-start-for-p100pascal-gpus)).
+  format (experimental, CPU-validated only — real P100 CUDA and LAMMPS
+  runtime validation is pending). See
+  [Quick Start](#quick-start-for-p100pascal-gpus).
 - ✅ DPA-4 inference in **LAMMPS** via the `.pth` frozen model:
   - **Energy models**: use ``pair_style deepmd frozen_model.pth`` with the
     standard ``DeepPotPT`` loader.
@@ -310,6 +336,12 @@ What **does not work** on Pascal:
 - ❌ CuTe fused value-path (`DP_CUTE_INFER`) — unverified on `sm_60`; keep off.
 - ❌ bfloat16 autocast (`descriptor.use_amp=true` / `DP_AMP_INFER=1`) — no
   native bf16; auto-disabled with a warning.
+- ❌ ``fparam``, ``aparam``, and ``charge_spin`` model parameters — not
+  supported by the ``.pth`` freeze path.
+- ⚠️ Multi-rank LAMMPS (MPI) correctness — not yet verified for the ``.pth``
+  path. Single-rank runs are the recommended starting point.
+- ⚠️ The current development validation environment is **CPU-only**; real
+  P100/Pascal GPU runtime testing has not been performed.
 
 ### Volta (`sm_70`) and Turing (`sm_75`)
 
@@ -332,16 +364,20 @@ section-6 smoke test once to confirm your Triton build is healthy on your card.
 If you have a custom Triton build that *does* support Pascal, bypass the
 fail-fast guards:
 
-- `DP_FREEZE_FORCE_AOTI=1` — attempt the `.pt2` AOTInductor freeze on Pascal.
+- `DP_FREEZE_FORCE_AOTI=1` — **developer tool only, not for production use.**
+  Attempt the `.pt2` AOTInductor freeze on Pascal. AOTInductor lowering through
+  Triton is confirmed broken on P100; this escape hatch is provided for
+  debugging only.
 - The `torch.compile` guard has no override by design, because an unsupported
   compile path produces broken artifacts; use a Volta+ GPU instead.
 
 :::{note}
-**Performance note:** The `.pth` (TorchScript) freeze path is typically
-1.5–3× slower than `.pt2` (AOTInductor) on Volta+ GPUs because it lacks
-Triton-fused kernels. However, it is still fully GPU-accelerated (no CPU
-fallback) and is the only freeze option for Pascal. On Volta+ GPUs, use
-the standard `dp --pt freeze` (`.pt2`) for the best performance.
+**Performance note:** On Volta+ GPUs (where both paths are available), the
+``.pth`` (TorchScript) freeze path is typically 1.5–3× slower than ``.pt2``
+(AOTInductor) because it lacks Triton-fused kernels (measurements from
+Volta-class hardware). Pascal performance characteristics are unknown. The
+``.pth`` path is the only freeze option for Pascal-class GPUs. On Volta+
+GPUs, use the standard ``dp --pt freeze`` (``.pt2``) for the best performance.
 :::
 
 ## 8. How the `.pth` freeze path works
@@ -366,8 +402,10 @@ The `--legacy-gpu` flag triggers a different freeze pipeline:
 
 4. **Environment variable ``DP_FREEZE_FORCE_PTH``**: Set ``DP_FREEZE_FORCE_PTH=1``
    to force the `.pth` freeze path even on Volta+ GPUs (suppresses the
-   performance warning). This is useful for debugging or when you need
-   TorchScript portability across heterogeneous GPU clusters.
+   performance warning). **This is a developer tool, not a production feature.**
+   It may be useful for debugging or when you need TorchScript portability
+   across heterogeneous GPU clusters, but the resulting ``.pth`` has not been
+   validated on P100/Pascal hardware.
 
 5. **Energy model wrapper**: The `.pth` freeze produces a TorchScript module
    for **energy models only** (spin model `.pth` freezing is no longer
