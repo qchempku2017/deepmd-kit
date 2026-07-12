@@ -1311,7 +1311,7 @@ class LowerGraphNoParamAdapter(torch.nn.Module):
 
     Wraps an FX GraphModule and exposes a fixed TorchScript-compatible
     signature with explicit tensor types.  Used as the first stage of
-    two-stage tracing: the adapter is ``torch.jit.trace``-ed into a
+    two-stage tracing: the adapter is ``torch.jit.script``-ed into a
     self-contained ``ScriptModule`` that can then be stored inside the
     LAMMPS-facing ``SeZMPTHModel`` wrapper.
     """
@@ -1513,6 +1513,31 @@ class _BaseSeZMPTHModel(torch.nn.Module):
         """
         return self._use_spin
 
+    def _validate_unsupported_params(
+        self,
+        fparam: torch.Tensor | None,
+        aparam: torch.Tensor | None,
+        charge_spin: torch.Tensor | None,
+    ) -> None:
+        """Reject optional parameters that the frozen .pth lower graph cannot handle.
+
+        The six-tensor no-param energy contract does not support fparam,
+        aparam, or charge_spin.  Callers must pass ``None`` for these
+        parameters; non-``None`` values raise ``RuntimeError``.
+        """
+        if self._dim_fparam == 0 and fparam is not None:
+            raise RuntimeError(
+                "This frozen SeZM model has dim_fparam=0, but fparam was supplied."
+            )
+        if self._dim_aparam == 0 and aparam is not None:
+            raise RuntimeError(
+                "This frozen SeZM model has dim_aparam=0, but aparam was supplied."
+            )
+        if self._dim_chg_spin == 0 and charge_spin is not None:
+            raise RuntimeError(
+                "This frozen SeZM model has dim_chg_spin=0, but charge_spin was supplied."
+            )
+
 
 class SeZMPTHModel(_BaseSeZMPTHModel):
     """TorchScript-compatible wrapper for a SeZM frozen .pth model.
@@ -1567,18 +1592,7 @@ class SeZMPTHModel(_BaseSeZMPTHModel):
         # This wrapper is paired with LowerGraphNoParamAdapter, whose scripted
         # schema contains exactly six Tensor inputs. Reject unsupported optional
         # parameters before crossing the TorchScript module boundary.
-        if self._dim_fparam == 0 and fparam is not None:
-            raise RuntimeError(
-                "This frozen SeZM model has dim_fparam=0, but fparam was supplied."
-            )
-        if self._dim_aparam == 0 and aparam is not None:
-            raise RuntimeError(
-                "This frozen SeZM model has dim_aparam=0, but aparam was supplied."
-            )
-        if self._dim_chg_spin == 0 and charge_spin is not None:
-            raise RuntimeError(
-                "This frozen SeZM model has dim_chg_spin=0, but charge_spin was supplied."
-            )
+        self._validate_unsupported_params(fparam, aparam, charge_spin)
 
         # Pass extended_coord (not local-only dst_coord) so that the traced
         # lower graph receives the same input domain it was traced with.
@@ -1603,6 +1617,110 @@ class SeZMPTHModel(_BaseSeZMPTHModel):
             if do_atomic_virial:
                 model_predict["extended_virial"] = result["energy_derv_c"].squeeze(-2)
         return model_predict
+
+    @torch.jit.export
+    def forward_common_lower(
+        self,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_scatter_index: torch.Tensor,
+        edge_mask: torch.Tensor,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        comm_dict: dict[str, torch.Tensor] | None = None,
+        extended_atype: torch.Tensor | None = None,
+        extended_coord_corr: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
+        spin: torch.Tensor | None = None,
+        input_prec: torch.dtype | None = None,
+        use_compile: bool | None = None,
+        embedding_only: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Edge-schema ``forward_common_lower`` contract (``DeepEval``).
+
+        Delegates to the traced lower graph that was captured during
+        freeze.  Only the non-spin ``ener`` ABI is supported; spin,
+        ``dens``, ``fparam``, ``aparam``, and ``charge_spin`` models
+        are rejected by ``freeze_sezm_to_pth`` upstream, so this
+        method only handles the six-tensor no-param energy contract.
+
+        Parameters
+        ----------
+        coord
+            Coordinates with shape ``(nf, nall, 3)``.
+        atype
+            Local atom types with shape ``(nf, nloc)``.
+        edge_index
+            Edge (src, dst) pairs with shape ``(2, nedge)``
+            (all frames flattened; the lower graph was traced
+            with this format).
+        edge_vec
+            Edge displacement vectors with shape ``(nedge, 3)``.
+        edge_scatter_index
+            Force/virial scatter domain with shape ``(2, nedge)``.
+        edge_mask
+            Valid edge mask with shape ``(nedge,)``.
+        fparam
+            Frame parameters; must be ``None`` for the frozen .pth path.
+        aparam
+            Atomic parameters; must be ``None`` for the frozen .pth path.
+        comm_dict
+            Reserved for the LAMMPS parallel path; unused here.
+        extended_atype
+            Ghost atom types; unused in the serial path.
+        extended_coord_corr
+            Coordinate correction; unsupported in the .pth path.
+        charge_spin
+            Charge/spin tensor; must be ``None`` for the frozen .pth path.
+        spin
+            Spin tensor; unsupported spin ABI.
+        input_prec
+            Original input precision; ignored (the traced lower graph
+            already returns float32 tensors).
+        use_compile
+            Compile flag; ignored (the lower graph is already frozen).
+        embedding_only
+            If ``True``, return the embedding output only; unsupported.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Internal-key model output (``energy``, ``energy_redu``,
+            ``energy_derv_r``, ``energy_derv_c``, ``energy_derv_c_redu``).
+        """
+        # Reject unsupported optional parameters before crossing the
+        # TorchScript module boundary, matching forward_lower's guards.
+        self._validate_unsupported_params(fparam, aparam, charge_spin)
+        # Delegate to the traced lower graph — the same six-tensor
+        # compute that forward_lower invokes after converting the
+        # LAMMPS neighbour list to the edge schema.
+        if embedding_only:
+            raise NotImplementedError(
+                "embedding_only is not supported for frozen .pth SeZM models."
+            )
+        if not torch.jit.is_scripting():
+            if input_prec is not None:
+                log.debug(
+                    "forward_common_lower: input_prec=%s is ignored "
+                    "(the frozen lower graph always returns float32 tensors).",
+                    input_prec,
+                )
+            if use_compile is not None:
+                log.debug(
+                    "forward_common_lower: use_compile=%s is ignored "
+                    "(the lower graph is already frozen).",
+                    use_compile,
+                )
+        return self.lower_graph(
+            coord,
+            atype.to(dtype=torch.long),
+            edge_index.to(dtype=torch.long),
+            edge_vec,
+            edge_scatter_index.to(dtype=torch.long),
+            edge_mask,
+        )
 
 
 def freeze_sezm_to_pth(
@@ -1825,18 +1943,27 @@ def freeze_sezm_to_pth(
 
     # --- Two-stage tracing ---
     # Stage 1: convert the FX GraphModule into a self-contained ScriptModule
-    # through the concrete no-parameter energy ABI. The trace boundary receives
+    # through the concrete no-parameter energy ABI.  The adapter receives
     # exactly six Tensor inputs; no None or Optional[Tensor] value crosses it.
+    #
+    # torch.jit.script is used instead of torch.jit.trace so that the graph
+    # preserves dynamic shapes (nloc, nedge).  torch.jit.trace would bake the
+    # example-input shapes (nloc=7, nnei=181) into the ScriptModule, causing
+    # runtime failures when LAMMPS sends a different atom count.
+    #
+    # torch.jit.script on an adapter wrapping an FX GraphModule is safe
+    # because make_fx produces a graph of standard ATen operations that
+    # the TorchScript frontend fully supports.  The adapter's forward
+    # method is a trivial passthrough, so scripting succeeds as long as
+    # the inner FX graph is TorchScript-compatible (which it is, by
+    # construction).
     adapter = LowerGraphNoParamAdapter(traced).eval()
-    lower_trace_inputs = list(sample_inputs_cpu[:6])
     log.info(
-        "Stage 1: tracing the FX lower graph into a ScriptModule...",
+        "Stage 1: scripting the FX lower graph into a ScriptModule...",
     )
     try:
-        scripted_lower = torch.jit.trace(
-            adapter, lower_trace_inputs, strict=False, check_trace=True
-        )
-        log.info("Stage 1 succeeded: lower graph traced to ScriptModule.")
+        scripted_lower = torch.jit.script(adapter)
+        log.info("Stage 1 succeeded: lower graph scripted to ScriptModule.")
     except Exception as e:
         raise RuntimeError(
             "Failed to convert the FX lower graph into a self-contained "
