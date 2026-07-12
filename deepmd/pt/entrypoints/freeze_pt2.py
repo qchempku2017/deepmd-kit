@@ -276,23 +276,25 @@ def _validate_edge_schema_sync(
     ``torch.allclose`` for the float edge-vector.  Raises ``ValueError``
     with diagnostic detail on mismatch.
 
-    If ``edge_schema_from_extended`` itself raises (due to an unexpected
-    input shape or backend limitation), the error is logged and the freeze
-    proceeds without this specific validation step — the freeze itself may
-    still fail at a later stage if the inputs are truly invalid.
+    If ``edge_schema_from_extended`` itself raises a ``ValueError`` or
+    ``TypeError``, the error is wrapped in a ``RuntimeError`` and the freeze
+    is aborted.  ``RuntimeError`` from the reference implementation (e.g.
+    C++ extension failures) propagates directly to avoid double-wrapping
+    and to let the caller distinguish infrastructure failures from genuine
+    validation failures.  Silent skipping of this validation is unacceptable
+    because a bug in the reference implementation could produce an incorrect
+    frozen model.
     """
     try:
         ref_schema = edge_schema_from_extended(
             ext_coord, ext_atype_local, formatted_nlist, mapping
         )
-    except (RuntimeError, ValueError) as exc:
-        log.warning(
-            "Edge-schema sync check skipped: edge_schema_from_extended "
-            "raised %s.  The .pth freeze will proceed but the edge schema "
-            "has NOT been validated against the reference implementation.",
-            exc,
-        )
-        return
+    except RuntimeError:
+        raise
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"Reference edge-schema generation failed during .pth validation: {exc}"
+        ) from exc
 
     # Compute via _build_edge_schema_ts.
     nloc = int(ext_atype_local.shape[1])
