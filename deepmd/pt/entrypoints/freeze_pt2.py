@@ -1329,7 +1329,7 @@ class LowerGraphNoParamAdapter(torch.nn.Module):
         edge_scatter_index: torch.Tensor,
         edge_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        return self.graph(
+        result = self.graph(
             coord,
             atype,
             edge_index,
@@ -1340,6 +1340,14 @@ class LowerGraphNoParamAdapter(torch.nn.Module):
             None,
             None,
         )
+        return {
+            "energy": result["energy"],
+            "energy_redu": result["energy_redu"],
+            "energy_derv_r": result["energy_derv_r"],
+            "energy_derv_c": result["energy_derv_c"],
+            "energy_derv_c_redu": result["energy_derv_c_redu"],
+            "mask": result["mask"],
+        }
 
 
 class _BaseSeZMPTHModel(torch.nn.Module):
