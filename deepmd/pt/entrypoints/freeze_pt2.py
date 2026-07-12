@@ -1382,7 +1382,6 @@ class _BaseSeZMPTHModel(torch.nn.Module):
         mixed_types: bool,
         is_spin: bool,
         ntypes_spin: int,
-        use_spin: list[bool],
         lower_input_kind: str,
         lower_nf: int,
         do_grad_r: bool,
@@ -1409,7 +1408,10 @@ class _BaseSeZMPTHModel(torch.nn.Module):
         self._mixed_types = mixed_types
         self._is_spin = is_spin
         self._ntypes_spin = ntypes_spin
-        self._use_spin = use_spin
+        # TorchScript cannot infer the type of an empty list ([]), so use
+        # a non-empty [False] with explicit annotate so torch.jit.script
+        # can compile _use_spin as List[bool].
+        self._use_spin = torch.jit.annotate(list[bool], [False])
         self._lower_input_kind = lower_input_kind
         self._lower_nf = lower_nf
         self._do_grad_r = do_grad_r
@@ -1501,6 +1503,14 @@ class _BaseSeZMPTHModel(torch.nn.Module):
 
     @torch.jit.export
     def get_use_spin(self) -> list[bool]:
+        """Return per-type spin usage flags.
+
+        The .pth freeze path rejects spin models upstream (see
+        ``freeze_sezm_to_pth``), so this always returns ``[False]`` — a
+        TorchScript type-inference artifact rather than a meaningful spin
+        mask.  Callers should check ``has_spin()`` before interpreting
+        the return value.
+        """
         return self._use_spin
 
 
@@ -1668,6 +1678,10 @@ def freeze_sezm_to_pth(
     # --- Immediate support guards: reject unsupported models BEFORE any ---
     # --- tracing or sample-input construction.                         ---
     if is_spin:
+        # NOTE: If adding spin support below, also update the _use_spin
+        # sentinel in ``_BaseSeZMPTHModel.__init__`` and ``ntypes_spin``
+        # in ``freeze_sezm_to_pth`` (both are currently hardcoded for the
+        # non-spin path).
         raise NotImplementedError(
             "The legacy .pth exporter currently supports only non-spin "
             "SeZM/DPA4 energy models. Use the .pt2 freeze path "
@@ -1769,19 +1783,10 @@ def freeze_sezm_to_pth(
     default_chg_spin_val = _to_py_list(model.get_default_chg_spin())
     min_nbor_dist = model.get_min_nbor_dist()
     min_nbor_dist_val = float(min_nbor_dist) if min_nbor_dist is not None else None
-    # Spin metadata (only populated for spin models).
+    # Spin models are rejected upstream by ``freeze_sezm_to_pth``,
+    # so ``ntypes_spin`` is always 0.  ``_use_spin`` is hardcoded in
+    # the ``_BaseSeZMPTHModel`` constructor.
     ntypes_spin_val: int = 0
-    use_spin_val: list[bool] = []
-    if is_spin and hasattr(model, "spin"):
-        try:
-            ntypes_spin_val = int(model.spin.get_ntypes_spin())
-            use_spin_val = [bool(v) for v in model.spin.use_spin]
-        except (AttributeError, NotImplementedError):
-            log.debug(
-                "Could not extract spin metadata (ntypes_spin / use_spin) "
-                "from model.spin.",
-                exc_info=True,
-            )
     model_output_types: list[str] = []
     try:
         out_def = model.model_output_def()
@@ -1864,7 +1869,6 @@ def freeze_sezm_to_pth(
         "mixed_types": mixed_types_val,
         "is_spin": is_spin,
         "ntypes_spin": ntypes_spin_val,
-        "use_spin": use_spin_val,
         "lower_input_kind": _lower_input_kind,
         "lower_nf": 1,
         "do_grad_r": do_grad_r,

@@ -776,7 +776,6 @@ def _build_common_kwargs(
         "mixed_types": bool(model.mixed_types()),
         "is_spin": is_spin,
         "ntypes_spin": 0,
-        "use_spin": [],
         "lower_input_kind": model.export_lower_input_kind(),
         "lower_nf": 1,
         "do_grad_r": bool(model.do_grad_r("energy")),
