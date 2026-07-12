@@ -11,9 +11,10 @@ capability tiers** to keep straight:
 2. **Triton / `torch.compile` / `.pt2` freeze tier — requires Volta
    (`sm_70+`).** Triton (shipped with PyTorch 2.11/2.12) supports Volta and
    newer but **cannot compile for Pascal (`sm_60`)** — AOTInductor is confirmed
-   broken there. However, DPA-4 now has a **`.pth` (TorchScript) freeze path**
-   (`dp --pt freeze --legacy-gpu`) that covers LAMMPS inference on Pascal
-   without Triton (see the Quick Start below).
+   broken there. However, DPA-4 now has an **experimental `.pth` (TorchScript)
+    freeze path** (`dp --pt freeze --legacy-gpu`) that targets LAMMPS inference
+    on Pascal without Triton; CPU-side validation is provided, but real P100
+    CUDA and LAMMPS runtime validation is pending (see the Quick Start below).
 
 So a **Volta/Turing** user only needs point 1 (bf16 stays off, everything else
 works). A **Pascal (P100)** user needs bf16 off and the `.pth` freeze path
@@ -117,7 +118,7 @@ warning** on pre-Ampere GPUs.
 ## 2. Capability tiers at a glance
 
 | Family | Examples | Compute capability | native bf16 | `.pt2` / Triton / compile | `.pth` freeze / LAMMPS | What applies |
-|--------|----------|-------------------|-------------|---------------------------|------------------------|--------------| | Pascal | Tesla P100, GTX 10 | `sm_60`/`sm_62` | **no** | **no** | **✅ yes** (energy only) | bf16 auto-off; `.pth` freeze → LAMMPS (energy only, spin not supported); dense eager for train/test |
+|--------|----------|-------------------|-------------|---------------------------|------------------------|--------------| | Pascal | Tesla P100, GTX 10 | `sm_60`/`sm_62` | **no** | **no** | **⚠️ experimental** (CPU-validated; P100 untested) | bf16 auto-off; `.pth` freeze → LAMMPS (energy only, spin not supported; P100 validation pending); dense eager for train/test |
 | Volta | V100, Titan V | `sm_70`/`sm_72` | **no** | **yes** | yes (`.pt2` preferred) | bf16 auto-off; `.pt2`/compile/LAMMPS work |
 | Turing | RTX 20, T4 | `sm_75` | **no** | **yes** | yes (`.pt2` preferred) | bf16 auto-off; `.pt2`/compile/LAMMPS work |
 | Ampere | A100, RTX 30 | `sm_80`/`sm_86` | yes | yes | yes (`.pt2` preferred) | fully supported (all paths) |
@@ -302,7 +303,7 @@ What **works**:
   format (experimental, CPU-validated only — real P100 CUDA and LAMMPS
   runtime validation is pending). See
   [Quick Start](#quick-start-for-p100pascal-gpus).
-- ✅ DPA-4 inference in **LAMMPS** via the `.pth` frozen model:
+- ⚠️ DPA-4 inference in **LAMMPS** via the `.pth` frozen model (CPU-validated; P100 untested):
   - **Energy models**: use ``pair_style deepmd frozen_model.pth`` with the
     standard ``DeepPotPT`` loader.
   - **Spin models**: no longer supported by the `.pth` freeze path on Pascal.
@@ -471,10 +472,14 @@ pair_coeff * * O H
 
 ## 10. Why this design
 
-The dense float32 reference path is the same one DeePMD-kit uses to validate
-the optimized kernels for numerical correctness, so running it on a legacy GPU
-gives the **same physics** as a modern GPU (modulo floating-point
-reduction-order differences). There is no accuracy penalty for using the
-legacy path — only a speed penalty relative to the fused Triton/CuTe kernels
-on Ampere+. For MD workflows sensitive to a smooth potential-energy surface,
+The dense float32 eager reference path is the same one DeePMD-kit uses to
+validate the optimized kernels for numerical correctness, so running it on a
+legacy GPU is expected to produce mathematically equivalent results to a modern
+GPU (modulo floating-point reduction-order differences). This equivalence
+applies to the dense float32 eager path used for training and ``dp --pt test``;
+the TorchScript ``.pth`` freeze path uses the same underlying model weights and
+is therefore expected to produce equivalent energies, but real-hardware
+validation on P100 is still pending. There should be no systematic accuracy
+penalty for using the legacy path — only a speed penalty relative to the fused
+Triton/CuTe kernels on Ampere+. For MD workflows sensitive to a smooth potential-energy surface,
 keep `DP_TF32_INFER=0` and `DP_AMP_INFER=0` (the defaults).
