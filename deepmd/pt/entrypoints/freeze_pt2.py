@@ -79,6 +79,10 @@ log = logging.getLogger(__name__)
 # Fixed nloc used for sample inputs during .pth freeze tracing.
 _PTH_SAMPLE_NLOC = 7
 
+# Minimum squared edge length to filter coincident (self-self) pairs.
+# Mirrors the literal ``1e-10`` threshold in deepmd/pt_expt/utils/edge_schema.py.
+_MIN_EDGE_LEN2 = 1e-10
+
 
 def _model_has_spin(model: torch.nn.Module) -> bool:
     """Return whether ``model`` uses the spin lower interface."""
@@ -161,6 +165,7 @@ def _build_edge_schema_ts(
     extended_coord: torch.Tensor,
     nloc: int,
     nnei: int,
+    mapping: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
     """Build edge schema tensors from a LAMMPS-format neighbour list.
 
@@ -170,53 +175,84 @@ def _build_edge_schema_ts(
     logic must stay in sync with ``edge_schema_from_extended`` in
     ``deepmd.pt_expt.utils.edge_schema``.
 
+    ``mapping`` has shape ``(nf, nall)``: for local atoms ``i < nloc``,
+    ``mapping[j][i] == i`` (identity); for ghost atoms ``i >= nloc``,
+    ``mapping[j][i]`` points to the local owner index.  Unlike
+    ``edge_schema_from_extended`` (which accepts ``mapping=None`` for the
+    no-ghost case), this function **requires** a non-None ``mapping`` tensor
+    because the TorchScript tracer needs the concrete tensor at trace time.
+
     Returns a tuple ``(edge_index, edge_vec, edge_scatter_index, edge_mask,
     nf)``.  The caller is responsible for extracting ``edge_src`` / ``edge_dst``
     or ``dst_coord`` as needed from the index tensors.
     """
     nf = fnlist.shape[0]
+    nall = extended_coord.shape[1]
     neighbor_flat = fnlist.reshape(-1)
     dst_actual = (
         torch.arange(neighbor_flat.shape[0], device=fnlist.device, dtype=torch.long)
         // nnei
     )
+    frame_idx = dst_actual // nloc
+    dst_local = dst_actual % nloc
     valid_flat = neighbor_flat >= 0
     neighbor_safe = torch.where(
         valid_flat, neighbor_flat, torch.zeros_like(neighbor_flat)
     )
     neighbor_safe_2d = neighbor_safe.to(dtype=torch.long).view(nf, nloc * nnei)
-    # Gather neighbour coordinates.
+
+    # Gather neighbour coordinates from the extended domain.
     neighbor_coord = torch.gather(
         extended_coord,
         1,
         neighbor_safe_2d.unsqueeze(-1).expand(-1, -1, 3),
     ).reshape(-1, 3)
-    # Gather destination (central atom) coordinates.
-    dst_local = dst_actual % nloc
+    # Gather destination (central atom) coordinates from the *local* slice only.
     dst_coord = torch.gather(
-        extended_coord,
+        extended_coord[:, :nloc, :],
         1,
-        dst_local.view(nf, nloc * nnei).unsqueeze(-1).expand(-1, -1, 3),
+        dst_local.view(nf, -1).unsqueeze(-1).expand(-1, -1, 3),
     ).reshape(-1, 3)
     edge_vec_all = neighbor_coord - dst_coord
-    edge_index_all = torch.stack([neighbor_safe, dst_actual], dim=0)
-    edge_scatter_all = edge_index_all
-    edge_mask_all = valid_flat
-    # Compact: keep only valid edges, mirroring edge_schema_from_extended.
-    valid_idx = torch.where(valid_flat)[0]
+    edge_len2 = torch.sum(edge_vec_all * edge_vec_all, dim=-1)
+
+    # Source local indices via the ghost→owner mapping.
+    src_local = torch.gather(mapping, 1, neighbor_safe_2d).reshape(-1)
+    src_actual = frame_idx * nloc + src_local.to(dtype=torch.long)
+    src_scatter = frame_idx * nall + neighbor_safe.to(dtype=torch.long)
+    dst_scatter = frame_idx * nall + dst_local
+
+    # edge_index uses the *local* domain (src_actual, dst_actual).
+    edge_index_all = torch.stack([src_actual, dst_actual], dim=0)
+    # edge_scatter_index uses the *extended* domain (src_scatter, dst_scatter).
+    edge_scatter_all = torch.stack([src_scatter, dst_scatter], dim=0)
+
+    # No ``edge_len2 <= rcut**2`` bound: nlist is contractually cutoff-truncated.
+    # Keep only valid neighbours whose source is local (drop ghost-only edges)
+    # and whose edge vector is non-zero (drop coincident pairs).
+    edge_keep = (
+        valid_flat
+        & (src_local >= 0)
+        & (src_local < nloc)
+        & (edge_len2 > _MIN_EDGE_LEN2)
+    )
+    valid_idx = torch.where(edge_keep)[0]
     edge_index = edge_index_all[:, valid_idx]
     edge_vec = edge_vec_all[valid_idx]
     edge_scatter_index = edge_scatter_all[:, valid_idx]
+
     # Append 2 dummy edges (matching _append_dummy_edges in edge_schema.py).
-    _DUMMY = 2
+    _DUMMY_EDGE_COUNT = 2
     device = fnlist.device
-    dummy_index = torch.zeros((2, _DUMMY), dtype=edge_index.dtype, device=device)
-    dummy_vec = torch.zeros((_DUMMY, 3), dtype=edge_vec.dtype, device=device)
+    dummy_index = torch.zeros(
+        (2, _DUMMY_EDGE_COUNT), dtype=edge_index.dtype, device=device
+    )
+    dummy_vec = torch.zeros((_DUMMY_EDGE_COUNT, 3), dtype=edge_vec.dtype, device=device)
     num_valid = valid_idx.shape[0]
     edge_mask = torch.cat(
         [
             torch.ones(num_valid, dtype=torch.bool, device=device),
-            torch.zeros(_DUMMY, dtype=torch.bool, device=device),
+            torch.zeros(_DUMMY_EDGE_COUNT, dtype=torch.bool, device=device),
         ]
     )
     edge_index = torch.cat([edge_index, dummy_index], dim=1)
@@ -235,28 +271,25 @@ def _validate_edge_schema_sync(
     produce identical tensors for the same inputs.
 
     The two functions must stay in sync; this function is called from
-    ``freeze_sezm_to_pth``.  A shape-only comparison runs **unconditionally**
-    on every freeze (it is cheap).  Full tensor equality is gated by the
-    ``DP_FREEZE_VALIDATE_EDGE_SCHEMA`` environment variable because it requires
-    materialising both edge schemas in memory.  Raises ``AssertionError`` on
-    mismatch.
+    ``freeze_sezm_to_pth``.  The full comparison runs **unconditionally**
+    on every freeze: shape, exact values for integer tensors, and
+    ``torch.allclose`` for the float edge-vector.  Raises ``ValueError``
+    with diagnostic detail on mismatch.
+
+    If ``edge_schema_from_extended`` itself raises (due to an unexpected
+    input shape or backend limitation), the error is logged and the freeze
+    proceeds without this specific validation step — the freeze itself may
+    still fail at a later stage if the inputs are truly invalid.
     """
-    validate_values = os.environ.get(
-        "DP_FREEZE_VALIDATE_EDGE_SCHEMA", ""
-    ).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
     try:
         ref_schema = edge_schema_from_extended(
             ext_coord, ext_atype_local, formatted_nlist, mapping
         )
-    except Exception as exc:
+    except (RuntimeError, ValueError) as exc:
         log.warning(
-            "Edge-schema sync check: edge_schema_from_extended raised %s; "
-            "skipping validation.",
+            "Edge-schema sync check skipped: edge_schema_from_extended "
+            "raised %s.  The .pth freeze will proceed but the edge schema "
+            "has NOT been validated against the reference implementation.",
             exc,
         )
         return
@@ -264,80 +297,57 @@ def _validate_edge_schema_sync(
     # Compute via _build_edge_schema_ts.
     nloc = int(ext_atype_local.shape[1])
     nnei = int(formatted_nlist.shape[2])
-    ts_result = _build_edge_schema_ts(formatted_nlist, ext_coord, nloc, nnei)
+    ts_result = _build_edge_schema_ts(formatted_nlist, ext_coord, nloc, nnei, mapping)
     ts_edge_index, ts_edge_vec, ts_edge_scatter_index, ts_edge_mask, ts_nf = ts_result
 
-    # --- unconditional shape check ---
-    shape_errors: list[str] = []
+    device = ts_edge_index.device
+    errors: list[str] = []
+
+    # Integer tensors: exact equality.
     for name, ts_val, ref_val in (
         ("edge_index", ts_edge_index, ref_schema.edge_index),
-        ("edge_vec", ts_edge_vec, ref_schema.edge_vec),
-        (
-            "edge_scatter_index",
-            ts_edge_scatter_index,
-            ref_schema.edge_scatter_index,
-        ),
+        ("edge_scatter_index", ts_edge_scatter_index, ref_schema.edge_scatter_index),
         ("edge_mask", ts_edge_mask, ref_schema.edge_mask),
     ):
-        if ts_val.shape != ref_val.shape:
-            shape_errors.append(
+        ref_val_dev = ref_val.to(device=device)
+        if ts_val.shape != ref_val_dev.shape:
+            errors.append(
                 f"  {name}: shape mismatch TS={tuple(ts_val.shape)} "
-                f"ref={tuple(ref_val.shape)}"
+                f"ref={tuple(ref_val_dev.shape)}"
+            )
+        elif not bool(torch.equal(ts_val, ref_val_dev)):
+            diff = (ts_val.long() - ref_val_dev.long()).abs()
+            max_diff = int(diff.max())
+            mismatch_count = int((diff > 0).sum())
+            errors.append(
+                f"  {name}: values differ ({mismatch_count} elements, "
+                f"max abs diff={max_diff})"
             )
 
-    if shape_errors:
+    # Float tensor: numerical equality via allclose.
+    ref_vec_dev = ref_schema.edge_vec.to(device=device)
+    if ts_edge_vec.shape != ref_vec_dev.shape:
+        errors.append(
+            f"  edge_vec: shape mismatch TS={tuple(ts_edge_vec.shape)} "
+            f"ref={tuple(ref_vec_dev.shape)}"
+        )
+    elif not torch.allclose(ts_edge_vec, ref_vec_dev, rtol=1e-5, atol=1e-8):
+        max_diff = float((ts_edge_vec - ref_vec_dev).abs().max())
+        errors.append(f"  edge_vec: values differ (max abs diff={max_diff:.2e})")
+
+    if errors:
         msg = (
-            "Edge-schema sync check FAILED (shape): _build_edge_schema_ts and "
+            "Edge-schema sync check FAILED: _build_edge_schema_ts and "
             "edge_schema_from_extended diverged!\n"
-            + "\n".join(shape_errors)
+            + "\n".join(errors)
             + "\nThis is a bug -- the .pth freeze may produce incorrect results. "
-            "Please report it."
+            "Please report it at https://github.com/deepmodeling/deepmd-kit/issues."
         )
         log.error(msg)
-        raise AssertionError(msg)
+        raise ValueError(msg)
 
-    # --- opt-in value check ---
-    if not validate_values:
-        log.info(
-            "Edge-schema shape check passed: _build_edge_schema_ts shapes match "
-            "edge_schema_from_extended for nloc=%d, nnei=%d.  "
-            "Set DP_FREEZE_VALIDATE_EDGE_SCHEMA=1 for a full value comparison.",
-            nloc,
-            nnei,
-        )
-        return
-
-    value_errors: list[str] = []
-    for name, ts_val, ref_val in (
-        ("edge_index", ts_edge_index, ref_schema.edge_index),
-        ("edge_vec", ts_edge_vec, ref_schema.edge_vec),
-        (
-            "edge_scatter_index",
-            ts_edge_scatter_index,
-            ref_schema.edge_scatter_index,
-        ),
-        ("edge_mask", ts_edge_mask, ref_schema.edge_mask),
-    ):
-        if not bool(torch.equal(ts_val, ref_val.to(device=ts_val.device))):
-            max_diff = float(
-                (ts_val.float() - ref_val.float().to(ts_val.device)).abs().max()
-            )
-            value_errors.append(
-                f"  {name}: values differ (max abs diff={max_diff:.2e})"
-            )
-
-    if value_errors:
-        msg = (
-            "Edge-schema sync check FAILED (values): _build_edge_schema_ts and "
-            "edge_schema_from_extended diverged!\n"
-            + "\n".join(value_errors)
-            + "\nThis is a bug -- the .pth freeze may produce incorrect results. "
-            "Please report it."
-        )
-        log.error(msg)
-        raise AssertionError(msg)
     log.info(
-        "Edge-schema sync check passed (shapes + values): "
+        "Edge-schema sync check passed: "
         "_build_edge_schema_ts matches edge_schema_from_extended "
         "for nloc=%d, nnei=%d.",
         nloc,
@@ -1282,10 +1292,9 @@ def freeze_sezm_to_pt2(
 def _format_nlist_to_nnei(nlist: torch.Tensor, nnei_target: int) -> torch.Tensor:
     """Pad or truncate a LAMMPS neighbour list to exactly ``nnei`` columns.
 
-    Shared by the ``forward_lower`` methods of both ``SeZMPTHModel`` and
-    ``SeZMSpinPTHModel`` to ensure the traced lower graph receives a
-    consistent nnei dimension regardless of the actual LAMMPS neighbour
-    count.
+    Used by ``SeZMPTHModel.forward_lower`` to ensure the traced lower graph
+    receives a consistent nnei dimension regardless of the actual LAMMPS
+    neighbour count.
     """
     nf, nloc_val, nsel_in = nlist.shape
     if nsel_in < nnei_target:
@@ -1311,7 +1320,7 @@ class LowerGraphNoParamAdapter(torch.nn.Module):
     signature with explicit tensor types.  Used as the first stage of
     two-stage tracing: the adapter is ``torch.jit.trace``-ed into a
     self-contained ``ScriptModule`` that can then be stored inside the
-    LAMMPS-facing ``SeZMPTHModel`` / ``SeZMSpinPTHModel`` wrapper.
+    LAMMPS-facing ``SeZMPTHModel`` wrapper.
     """
 
     def __init__(self, graph: torch.nn.Module) -> None:
@@ -1338,226 +1347,6 @@ class LowerGraphNoParamAdapter(torch.nn.Module):
             None,
             None,
         )
-
-
-class LowerGraphFParamAdapter(torch.nn.Module):
-    """Concrete adapter for FX lower graphs with fparam only."""
-
-    def __init__(self, graph: torch.nn.Module) -> None:
-        super().__init__()
-        self.graph = graph
-
-    def forward(
-        self,
-        coord: torch.Tensor,
-        atype: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_vec: torch.Tensor,
-        edge_scatter_index: torch.Tensor,
-        edge_mask: torch.Tensor,
-        fparam: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        return self.graph(
-            coord,
-            atype,
-            edge_index,
-            edge_vec,
-            edge_scatter_index,
-            edge_mask,
-            fparam,
-            None,
-            None,
-        )
-
-
-class LowerGraphFullParamAdapter(torch.nn.Module):
-    """Concrete adapter for FX lower graphs with all optional params."""
-
-    def __init__(self, graph: torch.nn.Module) -> None:
-        super().__init__()
-        self.graph = graph
-
-    def forward(
-        self,
-        coord: torch.Tensor,
-        atype: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_vec: torch.Tensor,
-        edge_scatter_index: torch.Tensor,
-        edge_mask: torch.Tensor,
-        fparam: torch.Tensor,
-        aparam: torch.Tensor,
-        charge_spin: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        return self.graph(
-            coord,
-            atype,
-            edge_index,
-            edge_vec,
-            edge_scatter_index,
-            edge_mask,
-            fparam,
-            aparam,
-            charge_spin,
-        )
-
-
-class LowerGraphSpinNoParamAdapter(torch.nn.Module):
-    """Concrete adapter for spin FX lower graphs with no optional params.
-
-    Matches the nlist ABI: (extended_coord, extended_atype, extended_spin,
-    nlist, mapping).
-    """
-
-    def __init__(self, graph: torch.nn.Module) -> None:
-        super().__init__()
-        self.graph = graph
-
-    def forward(
-        self,
-        extended_coord: torch.Tensor,
-        extended_atype: torch.Tensor,
-        extended_spin: torch.Tensor,
-        nlist: torch.Tensor,
-        mapping: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        return self.graph(
-            extended_coord,
-            extended_atype,
-            extended_spin,
-            nlist,
-            mapping,
-            None,
-            None,
-            None,
-        )
-
-
-class LowerGraphSpinFParamAdapter(torch.nn.Module):
-    """Concrete adapter for spin FX lower graphs with fparam only."""
-
-    def __init__(self, graph: torch.nn.Module) -> None:
-        super().__init__()
-        self.graph = graph
-
-    def forward(
-        self,
-        extended_coord: torch.Tensor,
-        extended_atype: torch.Tensor,
-        extended_spin: torch.Tensor,
-        nlist: torch.Tensor,
-        mapping: torch.Tensor,
-        fparam: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        return self.graph(
-            extended_coord,
-            extended_atype,
-            extended_spin,
-            nlist,
-            mapping,
-            fparam,
-            None,
-            None,
-        )
-
-
-class LowerGraphSpinFullParamAdapter(torch.nn.Module):
-    """Concrete adapter for spin FX lower graphs with all optional params."""
-
-    def __init__(self, graph: torch.nn.Module) -> None:
-        super().__init__()
-        self.graph = graph
-
-    def forward(
-        self,
-        extended_coord: torch.Tensor,
-        extended_atype: torch.Tensor,
-        extended_spin: torch.Tensor,
-        nlist: torch.Tensor,
-        mapping: torch.Tensor,
-        fparam: torch.Tensor,
-        aparam: torch.Tensor,
-        charge_spin: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        return self.graph(
-            extended_coord,
-            extended_atype,
-            extended_spin,
-            nlist,
-            mapping,
-            fparam,
-            aparam,
-            charge_spin,
-        )
-
-
-def _select_lower_adapter(
-    dim_fparam: int,
-    dim_aparam: int,
-    dim_chg_spin: int,
-    is_spin: bool = False,
-) -> type[torch.nn.Module]:
-    """Select the appropriate concrete adapter class for the lower graph.
-
-    Always returns the ``FullParam`` variant because the LAMMPS-facing
-    ``forward_lower`` methods always pass the full positional tuple
-    (9 args for energy, 8 args for spin) to ``self.lower_graph()``,
-    and the traced ``ScriptModule`` must accept the same signature.
-
-    Parameters
-    ----------
-    dim_fparam : int
-        Frame-level parameter dimension.
-    dim_aparam : int
-        Atom-level parameter dimension.
-    dim_chg_spin : int
-        Charge / spin channel dimension.
-    is_spin : bool
-        Whether the lower graph follows the spin (nlist) ABI.
-
-    Returns
-    -------
-    type[torch.nn.Module]
-        ``LowerGraphFullParamAdapter`` or ``LowerGraphSpinFullParamAdapter``.
-    """
-    if is_spin:
-        return LowerGraphSpinFullParamAdapter
-    else:
-        return LowerGraphFullParamAdapter
-
-
-def _build_lower_trace_inputs(
-    sample_inputs: tuple[torch.Tensor | None, ...],
-    dim_fparam: int,
-    dim_aparam: int,
-    dim_chg_spin: int,
-    is_spin: bool = False,
-) -> list[torch.Tensor]:
-    """Build the trace inputs for the FullParam adapter from the full sample.
-
-    Always returns the full positional tuple because ``_select_lower_adapter``
-    always selects the ``FullParam`` variant, and the traced ``ScriptModule``
-    must match the 9-arg (energy) or 8-arg (spin) signature that
-    ``forward_lower`` uses.
-
-    Parameters
-    ----------
-    sample_inputs
-        The full sample tuple from ``_make_sample_inputs``.
-    dim_fparam, dim_aparam, dim_chg_spin
-        Unused; retained for API compatibility.
-    is_spin
-        If True, returns the 8-element spin (nlist) ABI prefix.
-
-    Returns
-    -------
-    list[torch.Tensor]
-        The full prefix of sample_inputs (9 for energy, 8 for spin).
-    """
-    if is_spin:
-        return list(sample_inputs[:8])
-    else:
-        return list(sample_inputs[:9])
 
 
 class _BaseSeZMPTHModel(torch.nn.Module):
@@ -1723,12 +1512,12 @@ class _BaseSeZMPTHModel(torch.nn.Module):
 
 
 class SeZMPTHModel(_BaseSeZMPTHModel):
-    """TorchScript-compatible wrapper for a non-spin SeZM frozen .pth model.
+    """TorchScript-compatible wrapper for a SeZM frozen .pth model.
 
     Exposes ``forward_lower`` with the standard ``DeepPotPT`` LAMMPS
     contract.  The edge-level compute graph (from ``make_fx``) is stored
     on the parent class and invoked after converting the LAMMPS neighbour
-    list to the edge schema.
+    list to the edge schema.  Only non-spin energy models are supported.
     """
 
     @torch.jit.export
@@ -1748,13 +1537,8 @@ class SeZMPTHModel(_BaseSeZMPTHModel):
 
         Converts the LAMMPS neighbour list to the edge schema, runs the
         traced lower graph, and post-processes the output into the format
-        expected by ``DeepPotPT``.
-
-        .. note::
-           Only the energy (non-spin) edge ABI is supported by this wrapper.
-           ``DeepPotPT.forward_lower`` does not supply ``extended_spin``.
-           Spin models are routed to ``SeZMSpinPTHModel`` instead, which
-           implements the ``DeepSpinPT`` contract.
+        expected by ``DeepPotPT``.  Only non-spin energy models are
+        supported; spin models must use the ``.pt2`` freeze path.
         """
         # --- Step 1: format nlist (pad/truncate to nnei) ---
         nnei_target = self._nnei
@@ -1762,6 +1546,10 @@ class SeZMPTHModel(_BaseSeZMPTHModel):
         nf, nloc_val, _ = fnlist.shape
 
         # --- Step 2: build edge schema via shared helper ---
+        if mapping is None:
+            raise RuntimeError(
+                "SeZMPTHModel.forward_lower requires a valid mapping tensor."
+            )
         (
             edge_index,
             edge_vec,
@@ -1769,35 +1557,31 @@ class SeZMPTHModel(_BaseSeZMPTHModel):
             edge_mask,
             _nf,
         ) = _build_edge_schema_ts(
-            fnlist, extended_coord, int(nloc_val), int(nnei_target)
-        )
-        dst_coord = extended_coord.gather(
-            1,
-            torch.arange(nloc_val, device=fnlist.device)
-            .view(1, nloc_val, 1)
-            .expand(_nf, nloc_val, 3),
+            fnlist, extended_coord, int(nloc_val), int(nnei_target), mapping
         )
 
         # --- Step 3: call the traced lower graph ---
         # This wrapper is paired with LowerGraphNoParamAdapter, whose scripted
         # schema contains exactly six Tensor inputs. Reject unsupported optional
         # parameters before crossing the TorchScript module boundary.
-        if fparam is not None:
+        if self._dim_fparam == 0 and fparam is not None:
             raise RuntimeError(
                 "This frozen SeZM model has dim_fparam=0, but fparam was supplied."
             )
-        if aparam is not None:
+        if self._dim_aparam == 0 and aparam is not None:
             raise RuntimeError(
                 "This frozen SeZM model has dim_aparam=0, but aparam was supplied."
             )
-        if charge_spin is not None:
+        if self._dim_chg_spin == 0 and charge_spin is not None:
             raise RuntimeError(
                 "This frozen SeZM model has dim_chg_spin=0, but charge_spin was supplied."
             )
 
+        # Pass extended_coord (not local-only dst_coord) so that the traced
+        # lower graph receives the same input domain it was traced with.
         atype_local = extended_atype[:, :nloc_val].to(dtype=torch.long)
         result = self.lower_graph(
-            dst_coord,
+            extended_coord,
             atype_local,
             edge_index.to(dtype=torch.long),
             edge_vec,
@@ -1811,85 +1595,6 @@ class SeZMPTHModel(_BaseSeZMPTHModel):
         model_predict["energy"] = result["energy_redu"]
         if self._do_grad_r:
             model_predict["extended_force"] = result["energy_derv_r"].squeeze(-2)
-        if self._do_grad_c:
-            model_predict["virial"] = result["energy_derv_c_redu"].squeeze(-2)
-            if do_atomic_virial:
-                model_predict["extended_virial"] = result["energy_derv_c"].squeeze(-2)
-        return model_predict
-
-
-class SeZMSpinPTHModel(_BaseSeZMPTHModel):
-    """TorchScript-compatible wrapper for a spin SeZM frozen .pth model.
-
-    Exposes ``forward_lower`` with the ``DeepSpinPT`` LAMMPS contract
-    (``extended_spin`` between ``extended_atype`` and ``nlist``) so
-    LAMMPS can load and call it via ``pair_style deepmd/spin``.
-
-    Supports the ``nlist`` lower ABI (virtual-spin / deepspin scheme)
-    where the traced lower graph places virtual atoms internally from
-    the extended inputs and raw neighbour list.  The ``edge_vec`` ABI
-    (native spin) is not yet supported by this wrapper.
-
-    .. note::
-       This class is currently **disabled** and not instantiated by
-       ``freeze_sezm_to_pth``, which raises ``NotImplementedError`` for
-       spin models. It is retained in the codebase as a reference for
-       potential future re-enablement of spin ``.pth`` freeze support.
-       Spin model ``.pt2`` (AOTInductor) freezing via
-       ``freeze_sezm_to_pt2`` continues to work on Volta+ GPUs.
-    """
-
-    @torch.jit.export
-    def forward_lower(
-        self,
-        extended_coord: torch.Tensor,
-        extended_atype: torch.Tensor,
-        extended_spin: torch.Tensor,
-        nlist: torch.Tensor,
-        mapping: torch.Tensor | None = None,
-        fparam: torch.Tensor | None = None,
-        aparam: torch.Tensor | None = None,
-        do_atomic_virial: bool = False,
-        comm_dict: dict[str, torch.Tensor] | None = None,
-        charge_spin: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """``DeepSpinPT`` LAMMPS ``forward_lower`` contract.
-
-        The traced lower graph (``nlist`` ABI) places virtual atoms
-        internally, so this wrapper formats the LAMMPS neighbour list
-        and passes the raw extended inputs straight through.
-
-        .. note::
-           ``DeepSpinPT`` does **not** pass ``charge_spin``; the
-           parameter is accepted for signature compatibility but is
-           always ``None`` at runtime.
-        """
-        # --- Step 1: format nlist (pad/truncate to nnei) ---
-        fnlist = _format_nlist_to_nnei(nlist, self._nnei)
-
-        # --- Step 2: call the traced lower graph (nlist ABI) ---
-        lower_inputs = (
-            extended_coord,
-            extended_atype.to(dtype=torch.long),
-            extended_spin,
-            fnlist,
-            mapping,
-            fparam,
-            aparam,
-            charge_spin,
-        )
-        result = self.lower_graph(*lower_inputs)
-
-        # --- Step 3: post-process output ---
-        model_predict: dict[str, torch.Tensor] = {}
-        model_predict["atom_energy"] = result["energy"]
-        model_predict["energy"] = result["energy_redu"]
-        model_predict["extended_mask_mag"] = result["mask_mag"]
-        if self._do_grad_r:
-            model_predict["extended_force"] = result["energy_derv_r"].squeeze(-2)
-            model_predict["extended_force_mag"] = result["energy_derv_r_mag"].squeeze(
-                -2
-            )
         if self._do_grad_c:
             model_predict["virial"] = result["energy_derv_c_redu"].squeeze(-2)
             if do_atomic_virial:
@@ -1967,6 +1672,53 @@ def freeze_sezm_to_pth(
     _state_dict, params, model = _load_sezm_checkpoint(ckpt_path, head)
     is_spin = _model_has_spin(model)
 
+    # --- Immediate support guards: reject unsupported models BEFORE any ---
+    # --- tracing or sample-input construction.                         ---
+    if is_spin:
+        raise NotImplementedError(
+            "The legacy .pth exporter currently supports only non-spin "
+            "SeZM/DPA4 energy models. Use the .pt2 freeze path "
+            "(dp --pt freeze without --legacy-gpu) for spin models."
+        )
+
+    dim_fparam = int(model.get_dim_fparam())
+    dim_aparam = int(model.get_dim_aparam())
+    dim_chg_spin = int(model.get_dim_chg_spin())
+    if dim_fparam != 0 or dim_aparam != 0 or dim_chg_spin != 0:
+        raise NotImplementedError(
+            "The legacy .pth exporter currently supports only models with "
+            "dim_fparam=dim_aparam=dim_chg_spin=0. "
+            f"This model has dim_fparam={dim_fparam}, dim_aparam={dim_aparam}, "
+            f"dim_chg_spin={dim_chg_spin}. "
+            "Use the .pt2 freeze path (dp --pt freeze without --legacy-gpu) "
+            "instead."
+        )
+
+    mixed_types_val = bool(model.mixed_types())
+    if not mixed_types_val:
+        raise ValueError(
+            "The .pth (TorchScript) freeze path requires mixed_types=True for "
+            "SeZM/DPA4 models. This model has mixed_types=False. "
+            "The traced lower graph expects a non-type-distinguished neighbour "
+            "list format (all atom types share the same neighbour slots), "
+            "while LAMMPS sends a type-distinguished neighbour list when "
+            "mixed_types=False — the shapes match (same nnei) but the "
+            "neighbour ordering is incompatible, which can produce silently "
+            "incorrect results. "
+            "Use the .pt2 freeze path (dp --pt freeze without --legacy-gpu) "
+            "instead."
+        )
+
+    # Verify the model is an energy model.
+    output_def = model.atomic_output_def()
+    if "energy" not in output_def.var_defs:
+        raise ValueError(
+            "The .pth (TorchScript) freeze path only supports energy models. "
+            f"This model outputs: {list(output_def.var_defs.keys())}. "
+            "Use the .pt2 freeze path (dp --pt freeze without --legacy-gpu) "
+            "instead."
+        )
+
     # Determine the lower input kind.  Spin models (SeZM) use the "nlist"
     # ABI where virtual atoms are placed inside the traced graph; non-spin
     # models use the "edge_vec" ABI where the wrapper builds the edge
@@ -2011,33 +1763,14 @@ def freeze_sezm_to_pth(
     ntypes = _get_model_ntypes(model)
     rcut = float(model.get_rcut())
     sel = [int(s) for s in model.get_sel()]
-    dim_fparam = int(model.get_dim_fparam())
-    dim_aparam = int(model.get_dim_aparam())
-    dim_chg_spin = int(model.get_dim_chg_spin())
-    if is_spin:
-        raise NotImplementedError(
-            "The legacy .pth exporter currently supports only non-spin "
-            "SeZM/DPA4 energy models."
-        )
-    if dim_fparam != 0 or dim_aparam != 0 or dim_chg_spin != 0:
-        raise NotImplementedError(
-            "The legacy .pth exporter currently supports only models with "
-            "dim_fparam=dim_aparam=dim_chg_spin=0."
-        )
+    # dim_fparam, dim_aparam, dim_chg_spin, mixed_types_val were already
+    # extracted and validated by the early support guards above.
     type_map = list(model.get_type_map())
     has_mp = _model_has_message_passing(model)
     nnei = int(sum(sel))
     nsel_val = nnei
     do_grad_r = bool(model.do_grad_r("energy"))
     do_grad_c = bool(model.do_grad_c("energy"))
-    mixed_types_val = bool(model.mixed_types())
-    if not mixed_types_val:
-        raise ValueError(
-            "The .pth (TorchScript) freeze path requires mixed_types=True for "
-            "SeZM/DPA4 models. This model has mixed_types=False. "
-            "Use the .pt2 freeze path (dp --pt freeze without --legacy-gpu) "
-            "instead."
-        )
     has_default_fparam_val = bool(model.has_default_fparam())
     default_fparam_val = _to_py_list(model.get_default_fparam())
     default_chg_spin_val = _to_py_list(model.get_default_chg_spin())
@@ -2070,24 +1803,26 @@ def freeze_sezm_to_pth(
         )
     model_def_json = json.dumps(params, default=str)
 
-    # --- Validate edge-schema sync (gated by env var) ---
+    # --- Validate edge-schema sync ---
     # Only applicable to non-spin models (edge_vec ABI) where the wrapper
     # builds the edge schema from the LAMMPS nlist.  Spin models use the
     # nlist ABI and pass raw inputs straight through.
     if not is_spin:
         try:
             formatted_nlist_sync = model.format_nlist(ext_coord, ext_atype, nlist_t)
+        except Exception as exc:
+            log.warning(
+                "Edge-schema sync check skipped: format_nlist raised %s. "
+                "The .pth freeze will proceed but the edge schema has NOT been "
+                "validated against the reference implementation.",
+                exc,
+            )
+        else:
             _validate_edge_schema_sync(
                 ext_coord,
                 ext_atype[:, :_PTH_SAMPLE_NLOC],
                 formatted_nlist_sync,
                 mapping_t,
-            )
-        except Exception:
-            log.debug(
-                "Edge-schema sync check skipped (could not build reference "
-                "formatted nlist).",
-                exc_info=True,
             )
 
     # --- Two-stage tracing ---
@@ -2180,7 +1915,6 @@ def freeze_sezm_to_pth(
 
 __all__ = [
     "SeZMPTHModel",
-    "SeZMSpinPTHModel",
     "freeze_sezm_to_pt2",
     "freeze_sezm_to_pth",
     "is_sezm_checkpoint",
