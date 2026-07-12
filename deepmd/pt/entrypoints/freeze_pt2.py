@@ -79,10 +79,6 @@ log = logging.getLogger(__name__)
 # Fixed nloc used for sample inputs during .pth freeze tracing.
 _PTH_SAMPLE_NLOC = 7
 
-# Minimum squared edge length to filter coincident (self-self) pairs.
-# Mirrors the literal ``1e-10`` threshold in deepmd/pt_expt/utils/edge_schema.py.
-_MIN_EDGE_LEN2 = 1e-10
-
 
 def _model_has_spin(model: torch.nn.Module) -> bool:
     """Return whether ``model`` uses the spin lower interface."""
@@ -230,12 +226,7 @@ def _build_edge_schema_ts(
     # No ``edge_len2 <= rcut**2`` bound: nlist is contractually cutoff-truncated.
     # Keep only valid neighbours whose source is local (drop ghost-only edges)
     # and whose edge vector is non-zero (drop coincident pairs).
-    edge_keep = (
-        valid_flat
-        & (src_local >= 0)
-        & (src_local < nloc)
-        & (edge_len2 > _MIN_EDGE_LEN2)
-    )
+    edge_keep = valid_flat & (src_local >= 0) & (src_local < nloc) & (edge_len2 > 1e-10)
     valid_idx = torch.where(edge_keep)[0]
     edge_index = edge_index_all[:, valid_idx]
     edge_vec = edge_vec_all[valid_idx]

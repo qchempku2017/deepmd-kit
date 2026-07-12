@@ -76,8 +76,8 @@ def _set_cpu_default_device() -> None:
 _DUMMY_EDGE_COUNT = 2
 
 # Minimum squared edge length to filter coincident (self-self) pairs.
-# Mirrors _MIN_EDGE_LEN2 in deepmd/pt/entrypoints/freeze_pt2.py and
-# the identical constant in deepmd/pt_expt/utils/edge_schema.py.
+# Mirrors the inline ``1e-10`` literal used in
+# deepmd/pt/entrypoints/freeze_pt2.py.
 _MIN_EDGE_LEN2 = 1e-10
 
 
